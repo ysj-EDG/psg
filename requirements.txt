@@ -1,0 +1,9 @@
+# Historical LOSO environment: Python 3.10.12; PyTorch CUDA 12.1 build.
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1+cu121
+numpy==2.2.6
+pandas==2.3.3
+h5py==3.16.0
+pyarrow==25.0.1
+scikit-learn==1.7.2
+scipy==1.15.3
