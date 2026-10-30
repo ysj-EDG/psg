@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+private/
+audit/
+tests/
+test_*.py
+verify_*.py
+smoke_*.py
+logs/
+checkpoints/
+cache/
+*.npz
+*.edf
+*.parquet
+*.joblib
+model.txt
