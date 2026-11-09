@@ -11,7 +11,7 @@ from __future__ import annotations
 from fractions import Fraction
 
 import numpy as np
-from scipy.signal import resample_poly
+from scipy.signal import butter, resample_poly, sosfiltfilt
 
 
 def pad_or_trim(
@@ -68,6 +68,32 @@ def resample_signal(
     return pad_or_trim(resampled, target_length)
 
 
+def resample_finite_signal(
+    values: np.ndarray,
+    source_rate: float,
+    target_rate: int,
+    target_length: int,
+) -> np.ndarray:
+    """只对已确认全 finite 的数组做采样率变换，不执行任何缺失值插值。"""
+
+    values = np.asarray(values, dtype=float).reshape(-1)
+    if not np.isfinite(values).all():
+        raise ValueError("resample_finite_signal requires an all-finite input")
+    rounded_rate = int(round(source_rate))
+    if rounded_rate <= 0 or not np.isclose(source_rate, rounded_rate, atol=1e-6):
+        raise ValueError(f"source_rate must be positive and integer-like: {source_rate}")
+    if target_rate <= 0:
+        raise ValueError(f"target_rate must be positive: {target_rate}")
+    ratio = Fraction(int(target_rate), rounded_rate)
+    resampled = resample_poly(
+        values,
+        up=ratio.numerator,
+        down=ratio.denominator,
+    )
+    return pad_or_trim(resampled, target_length)
+
+
+
 def reshape_epoch_signal(
     values: np.ndarray,
     *,
@@ -84,3 +110,32 @@ def reshape_epoch_signal(
         n_epochs,
         samples_per_epoch,
     )
+
+
+def bandpass_filter(
+    values: np.ndarray,
+    sampling_rate: float,
+    low_hz: float,
+    high_hz: float,
+    *,
+    order: int = 4,
+) -> np.ndarray:
+    """对已经确认全为有限值的 physical-amplitude waveform 做 Butterworth 带通。"""
+
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if not np.isfinite(values).all():
+        raise ValueError("bandpass_filter requires an all-finite input")
+    if sampling_rate <= 0 or low_hz <= 0 or high_hz <= low_hz:
+        raise ValueError("invalid sampling-rate or bandpass bounds")
+    if high_hz >= sampling_rate / 2.0:
+        raise ValueError("bandpass upper bound must be below Nyquist")
+    if values.size == 0:
+        return values.copy()
+    sos = butter(
+        order,
+        (low_hz, high_hz),
+        btype="bandpass",
+        fs=float(sampling_rate),
+        output="sos",
+    )
+    return sosfiltfilt(sos, values)

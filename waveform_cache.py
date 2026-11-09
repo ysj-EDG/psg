@@ -547,6 +547,109 @@ def write_schema_cache(
     return output
 
 
+
+def write_waveform_signals(
+    output_path: Path | str,
+    signals: dict[str, np.ndarray],
+) -> Path:
+    """将已经完成主路径处理的 modality arrays 写入 signals group。
+
+    正式 waveform dataset 统一使用 float32、NaN 缺失值、按 epoch 的 HDF5 chunk
+    和 gzip compression。本函数不做任何 signal 修复、归一化或量化。
+    """
+
+    output = Path(output_path)
+    expected_modalities = tuple(MODALITY_ORDER)
+    missing = [modality for modality in expected_modalities if modality not in signals]
+    extra = [modality for modality in signals if modality not in expected_modalities]
+    if missing or extra:
+        raise ValueError(f"signal modalities mismatch: missing={missing}, extra={extra}")
+
+    with h5py.File(output, "a") as handle:
+        group = handle["signals"]
+        if group.keys():
+            raise ValueError("signals group is not empty")
+        for modality in expected_modalities:
+            values = np.asarray(signals[modality], dtype=np.float32)
+            expected_channels = len(CANONICAL_CHANNEL_NAMES[modality])
+            if values.ndim != 3 or values.shape[1] != expected_channels:
+                raise ValueError(
+                    f"{modality} signal shape must be (T,{expected_channels},samples), "
+                    f"got {values.shape}"
+                )
+            if np.isinf(values).any():
+                raise ValueError(f"{modality} signal contains +/-Inf")
+            if values.shape[0] == 0 or values.shape[2] == 0:
+                raise ValueError(f"{modality} signal has an empty time axis: {values.shape}")
+            group.create_dataset(
+                modality,
+                data=values,
+                dtype=np.dtype("float32"),
+                chunks=(1, values.shape[1], values.shape[2]),
+                compression="gzip",
+                compression_opts=4,
+                shuffle=True,
+            )
+    return output
+
+
+def build_waveform_cache(
+    psg_path: Path | str,
+    caisr_path: Path | str,
+    output_path: Path | str,
+    *,
+    record_id: str,
+    site: str,
+) -> tuple[Path, object]:
+    """读取一个 record 的 selected waveform 并写入主路径 signals。"""
+
+    import pyedflib
+    from waveform_preprocessing import preprocess_selected_sources
+
+    psg_header = read_edf_header(psg_path)
+    caisr_header = read_edf_header(caisr_path)
+    source_plans = build_source_plans(
+        psg_header.channel_names,
+        psg_header.native_sampling_rates_hz,
+        psg_header.native_sample_counts,
+        psg_header.physical_dimensions,
+    )
+    n_epochs = int(math.floor(psg_header.duration_sec / EPOCH_DURATION_SEC))
+    reader = pyedflib.EdfReader(str(psg_path))
+    try:
+        result = preprocess_selected_sources(
+            source_plans,
+            psg_header,
+            read_signal=reader.readSignal,
+            n_epochs=n_epochs,
+        )
+    finally:
+        reader.close()
+    output = write_schema_cache(
+        output_path,
+        record_id=record_id,
+        site=site,
+        psg_header=psg_header,
+        caisr_header=caisr_header,
+    )
+    write_waveform_signals(output, result.signals)
+    return output, result
+
+
+def print_signal_reopen_report(path: Path | str) -> None:
+    """重新打开 waveform cache，打印 signals shape/dtype/chunk/compression。"""
+
+    cache_path = Path(path)
+    with h5py.File(cache_path, "r") as handle:
+        print("signals reopen report:")
+        for modality in MODALITY_ORDER:
+            dataset = handle[f"signals/{modality}"]
+            print(
+                f"  {modality}: shape={dataset.shape} dtype={dataset.dtype} "
+                f"chunks={dataset.chunks} compression={dataset.compression}"
+            )
+    print(f"file_size_bytes: {cache_path.stat().st_size}")
+
 def build_schema_cache(
     psg_path: Path | str,
     caisr_path: Path | str,
@@ -748,6 +851,11 @@ def main() -> None:
         help="使用 header metadata 和原始标签检查模式。",
     )
     parser.add_argument(
+        "--waveform-smoke",
+        action="store_true",
+        help="读取单个正常 record 的 selected waveform，执行主路径并写入 signals。",
+    )
+    parser.add_argument(
         "--source-plan-only",
         action="store_true",
         help="只读取 PSG header 并打印 20 个 canonical source plan，不写 cache。",
@@ -815,6 +923,28 @@ def main() -> None:
             print(f"  {left} <-> {right} (raw_channel_index={raw_index})")
         if not conflicts:
             print("  none")
+        return
+    if args.waveform_smoke:
+        output, waveform_result = build_waveform_cache(
+            args.psg,
+            args.caisr,
+            args.output,
+            record_id=args.record_id,
+            site=args.site,
+        )
+        print_source_plan(
+            build_source_plans(
+                psg_header.channel_names,
+                psg_header.native_sampling_rates_hz,
+                psg_header.native_sample_counts,
+                psg_header.physical_dimensions,
+            )
+        )
+        from waveform_preprocessing import print_raw_inspection, print_waveform_processing_report
+        print_raw_inspection(waveform_result)
+        print_waveform_processing_report(waveform_result)
+        print_schema_report(output)
+        print_signal_reopen_report(output)
         return
     caisr_header = read_edf_header(args.caisr)
     if args.metadata_only:
