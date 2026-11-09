@@ -72,3 +72,4 @@ reports/weekly/*
 *.h5
 *.hdf5
 waveform_record_output/
+spo2_audit_output/
