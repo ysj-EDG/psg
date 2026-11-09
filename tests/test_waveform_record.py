@@ -1,6 +1,11 @@
 import unittest
 
-from waveform_record import epoch_bounds, expected_output_names, inspection_epochs
+from waveform_record import (
+    epoch_bounds,
+    expected_output_names,
+    inspection_epochs,
+    plot_width_ratios,
+)
 
 
 class WaveformRecordInspectionTests(unittest.TestCase):
@@ -28,6 +33,23 @@ class WaveformRecordInspectionTests(unittest.TestCase):
                 "sub-I0002150026011_ses-2.txt",
             ),
         )
+
+    def test_plot_widths_follow_longest_channel_name_and_keep_signals_equal(self):
+        eeg_widths = plot_width_ratios(("EEG_F3", "EEG_C4"))
+        resp_widths = plot_width_ratios(
+            (
+                "NASAL_PRESSURE",
+                "THERMAL_AIRFLOW",
+                "AIRFLOW_UNSPECIFIED",
+                "PAP_FLOW",
+                "PAP_PRESSURE",
+                "THORACIC_EFFORT",
+                "ABDOMINAL_EFFORT",
+            )
+        )
+        self.assertEqual(eeg_widths[1], eeg_widths[2])
+        self.assertEqual(resp_widths[1], resp_widths[2])
+        self.assertGreater(resp_widths[0], eeg_widths[0])
 
 
 if __name__ == "__main__":

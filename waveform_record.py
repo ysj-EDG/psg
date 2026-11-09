@@ -367,6 +367,17 @@ def _plot_window_axis(
     ax.tick_params(labelsize=6)
 
 
+def plot_width_ratios(channel_names: tuple[str, ...]) -> tuple[float, float, float]:
+    """按最长 channel name 分配标签列，并等宽放大 raw/processed 列。"""
+
+    if not channel_names:
+        raise ValueError("channel_names must not be empty")
+    longest_name = max(len(str(name)) for name in channel_names)
+    name_width = max(2.0, longest_name / 4.5)
+    signal_width = 6.0
+    return name_width, signal_width, signal_width
+
+
 def render_modality_plot(
     *,
     modality: str,
@@ -387,10 +398,12 @@ def render_modality_plot(
 
     channel_names = CANONICAL_BY_MODALITY[modality]
     rows = len(channel_names) * len(epochs)
+    width_ratios = plot_width_ratios(channel_names)
     fig, axes = plt.subplots(
         rows,
         3,
-        figsize=(16, max(7.0, rows * 1.65)),
+        figsize=(24, max(7.0, rows * 1.65)),
+        gridspec_kw={"width_ratios": width_ratios},
         squeeze=False,
     )
     fig.suptitle(f"{modality.upper()} | {record_id}", fontsize=13, y=0.995)
@@ -407,8 +420,8 @@ def render_modality_plot(
             if not plan.channel_present or raw_values is None:
                 text_ax.axis("off")
                 text_ax.text(
-                    0.5, 0.54, canonical, ha="center", va="center",
-                    fontsize=8, weight="bold",
+                    0.96, 0.54, canonical, ha="right", va="center",
+                    fontsize=10, weight="bold",
                 )
                 text_ax.text(
                     0.5, 0.36, "STRUCTURALLY MISSING\nchannel_present=False",
@@ -446,8 +459,8 @@ def render_modality_plot(
                     ylim = (low - margin, high + margin)
                 text_ax.axis("off")
                 text_ax.text(
-                    0.5, 0.53, canonical, ha="center", va="center",
-                    fontsize=8, weight="bold",
+                    0.96, 0.53, canonical, ha="right", va="center",
+                    fontsize=10, weight="bold",
                 )
                 text_ax.text(
                     0.5, 0.34, f"{label}\nepoch={epoch}",
