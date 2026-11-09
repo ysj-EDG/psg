@@ -71,3 +71,4 @@ reports/weekly/*
 !reports/weekly/*.md
 *.h5
 *.hdf5
+waveform_record_output/

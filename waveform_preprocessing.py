@@ -94,6 +94,25 @@ class WaveformPreprocessResult:
     n_epochs: int
 
 
+def derive_canonical_raw(raw_values: Sequence[np.ndarray]) -> np.ndarray:
+    """按已冻结的 source plan 规则构造 native canonical waveform。
+
+    direct source 原样返回；paired/bipolar source 保持现有的
+    ``positive - negative`` 数值语义。该函数只是把原有内联运算提取为
+    inspection 工具可复用的纯函数，不改变任何数值处理行为。
+    """
+
+    if len(raw_values) == 1:
+        return np.asarray(raw_values[0], dtype=np.float64).reshape(-1)
+    if len(raw_values) == 2:
+        left = np.asarray(raw_values[0], dtype=np.float64).reshape(-1)
+        right = np.asarray(raw_values[1], dtype=np.float64).reshape(-1)
+        if left.size != right.size:
+            raise ValueError("paired source sample counts must match")
+        return left - right
+    raise ValueError(f"unsupported selected source count: {len(raw_values)}")
+
+
 def _percentile(values: np.ndarray, percentile: float) -> float:
     finite = values[np.isfinite(values)]
     if finite.size == 0:
@@ -257,9 +276,9 @@ def preprocess_selected_sources(
                         False, "source_sample_count_inconsistent", 0.0, False, False,
                     )
                     continue
-                native_values = raw_values[0] - raw_values[1]
+                native_values = derive_canonical_raw(raw_values)
             else:
-                native_values = raw_values[0]
+                native_values = derive_canonical_raw(raw_values)
 
             if modality in BANDPASS_RANGES_HZ:
                 low_hz, high_hz = BANDPASS_RANGES_HZ[modality]
