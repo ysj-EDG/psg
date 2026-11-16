@@ -2,23 +2,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
-# Local H100 extraction/training artifacts and generated data.
-npz_full/
-smoke_*data/
-smoke_model/
-smoke_output*/
-h100_smoke_output/
-h100*.py
-submit_h100_smoke.sh
-h100_cached_output_kaggle_quick/
-h100_cached_output_kaggle/
-lstm_cache_kaggle/
-lstm_cache_kaggle_quick/
-splits/
-medex-*.yaml
-requirements.local.no_torch.txt
-
-# Large generated arrays and model artifacts.
+# Local generated arrays and model artifacts.
 *.npz
 **/*.npz
 *.pt
@@ -27,49 +11,26 @@ requirements.local.no_torch.txt
 **/*.pth
 *.ckpt
 **/*.ckpt
-checkpoint/
-checkpoints/
 *.joblib
 **/*.joblib
 *.sav
 **/*.sav
 
-# Frozen local datasets and feature caches.
-npz_data2/
-npz_new/
-npz_1103_timegrid_v2/
-npz_sup20/
-
-# Local reports and documents are not part of the official submission.
-reports/
-docs/
-
-# Logs and local OS/editor metadata.
+# Local logs, caches, and generated audit outputs.
 *.log
 *.pid
 *.time
 *.tmp
 *.part
 .DS_Store
-
-# Local Medex launch and synchronization artifacts.
-medex_*.yaml
-.medex_run_*/
-
-# Local Docker experiments.
-Dockerfile*.local
-
-# Keep curated milestone outputs and weekly experiment records versioned.
-!reports/
-reports/*
-!reports/milestones/
-reports/milestones/*
-!reports/milestones/output/
-!reports/milestones/output/**
-!reports/weekly/
-reports/weekly/*
-!reports/weekly/*.md
+logs/
 *.h5
 *.hdf5
+waveform_cache/
+local_resume_output/
+waveform_cache_manifest.tsv
+cache_manifest.tsv
+cache_print.txt
 waveform_record_output/
-spo2_audit_output/
+records/
+HDF5_distribution/

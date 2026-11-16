@@ -317,19 +317,41 @@ def _summary_lines(
         )
 
     spo2_stats = _stats(raw_waveforms.get("SPO2"))
+    spo2_valid = result.quality.get("spo2_second_valid")
+    spo2_valid_fraction = (
+        float(np.asarray(spo2_valid, dtype=bool).mean())
+        if spo2_valid is not None and np.asarray(spo2_valid).size
+        else 0.0
+    )
+    spo2_valid_start = (
+        np.asarray(spo2_valid, dtype=bool)[0].astype(int).tolist()
+        if spo2_valid is not None and np.asarray(spo2_valid).shape[0]
+        else []
+    )
+    spo2_valid_end = (
+        np.asarray(spo2_valid, dtype=bool)[-1].astype(int).tolist()
+        if spo2_valid is not None and np.asarray(spo2_valid).shape[0]
+        else []
+    )
     lines.extend(
         [
             "",
             "SpO2:",
             f"EDF physical_dimension: {plans['SPO2'].physical_dimension}",
-            "observed numeric scale: retained exactly as EDF values; no automatic scale conversion",
+            "raw numeric scale: shown exactly as EDF values",
             (
-                "P1/P5/P50/P95/P99: "
+                "raw P1/P5/P50/P95/P99: "
                 f"{_fmt(spo2_stats['p1'])}/{_fmt(spo2_stats['p5'])}/"
                 f"{_fmt(spo2_stats['median'])}/{_fmt(spo2_stats['p95'])}/"
                 f"{_fmt(spo2_stats['p99'])}"
             ),
-            "scale conversion = NOT APPLIED",
+            f"canonical_unit: {result.canonical_units.get('spo2', '%')}",
+            f"scale_factor: {result.scale_factors.get('spo2', 1)}",
+            "per-second aggregation: nanmedian; target=1 Hz; interpolation=linear",
+            "invalid values: NaN before interpolation; second_valid retained pre-interpolation",
+            f"second_valid_fraction: {_fmt(spo2_valid_fraction)}",
+            f"second_valid_start_epoch: {spo2_valid_start}",
+            f"second_valid_end_epoch: {spo2_valid_end}",
             "",
             "missing slots:",
         ]
@@ -342,7 +364,8 @@ def _summary_lines(
     lines.extend(
         [
             "",
-            "inspection contract: no gap interpolation, normalization, quantization, "
+            "inspection contract: SpO2 uses only its per-second linear interpolation; "
+            "other modalities have no gap interpolation, normalization, quantization, "
             "clipping, zero-fill, notch, QC, CAISR annotation write, or feature extraction.",
         ]
     )
@@ -585,3 +608,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# cd /database/home/gaohaojie/workspace/psg
+# PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. \
+# /database/home/gaohaojie/.conda/envs/sleepfm_env/bin/python waveform_record.py
