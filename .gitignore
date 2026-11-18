@@ -50,3 +50,5 @@ tests/test_official_adaptation.py
 tests/test_train_lr.py
 tests/test_waveform_qc.py
 tests/test_waveform_qc_writer.py
+tests/
+logs/waveform_cache_full/local_resume_20261110.log
