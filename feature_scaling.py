@@ -1,0 +1,361 @@
+"""训练折专用的 CAISR20 v2 特征变换与标准化。"""
+
+from __future__ import annotations
+
+import json
+import argparse
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+
+
+CAISR20_FEATURE_NAMES = (
+    "caisr_sleep_tst_sec",
+    "caisr_sleep_se",
+    "caisr_sleep_sol_sec",
+    "caisr_sleep_rem_latency_sec",
+    "caisr_sleep_waso_sec",
+    "caisr_sleep_n1_pct",
+    "caisr_sleep_n2_pct",
+    "caisr_sleep_n3_pct",
+    "caisr_sleep_rem_pct",
+    "caisr_sleep_transition_rate",
+    "caisr_sleep_short_bout_ratio",
+    "caisr_sleep_mean_stage_entropy",
+    "caisr_arousal_arousal_index",
+    "caisr_arousal_arousal_burden_ratio",
+    "caisr_arousal_mean_arousal_duration",
+    "caisr_respiratory_respiratory_event_index",
+    "caisr_respiratory_respiratory_burden_ratio",
+    "caisr_respiratory_mean_resp_duration",
+    "caisr_limb_limb_movement_index",
+    "caisr_limb_plmi",
+)
+
+SCALER_VERSION = "caisr_v2_train_fold_scaler_v1"
+
+
+def _make_rules() -> dict[str, dict[str, Any]]:
+    rules: dict[str, dict[str, Any]] = {}
+    for name in CAISR20_FEATURE_NAMES:
+        rules[name] = {
+            "unit_transform": "identity",
+            "nonlinear": "identity",
+            "robust": False,
+        }
+    for index in (0, 2, 3, 4):
+        rules[CAISR20_FEATURE_NAMES[index]]["unit_transform"] = "sec_to_hour"
+        rules[CAISR20_FEATURE_NAMES[index]]["robust"] = True
+    for index in (14, 17):
+        rules[CAISR20_FEATURE_NAMES[index]]["unit_transform"] = "sec_to_minute"
+        rules[CAISR20_FEATURE_NAMES[index]]["nonlinear"] = "log1p"
+        rules[CAISR20_FEATURE_NAMES[index]]["robust"] = True
+    for index in (9, 12, 15, 18, 19):
+        rules[CAISR20_FEATURE_NAMES[index]]["nonlinear"] = "log1p"
+        rules[CAISR20_FEATURE_NAMES[index]]["robust"] = True
+    return rules
+
+
+DEFAULT_RULES = _make_rules()
+
+
+class FeatureScaler:
+    """按固定 CAISR20 顺序执行 train-fold-only 的缺失填补和标准化。
+
+    ``valid_mask=False`` 与非有限输入都被视为缺失；有限的零值仍是有效输入。
+    所有统计量只从 ``fit`` 收到的训练折计算，测试折只经过 ``transform``。
+    """
+
+    def __init__(
+        self,
+        feature_names: Sequence[str] | None = None,
+        rules: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> None:
+        names = list(CAISR20_FEATURE_NAMES if feature_names is None else feature_names)
+        if names != list(CAISR20_FEATURE_NAMES):
+            raise ValueError("CAISR20 feature names/order must match the frozen schema")
+        self.feature_names = names
+        self.rules = {
+            name: dict((rules or DEFAULT_RULES)[name]) for name in self.feature_names
+        }
+        self.version = SCALER_VERSION
+        self.fitted = False
+
+    @property
+    def n_features(self) -> int:
+        return len(self.feature_names)
+
+    def _validate_inputs(
+        self, values: np.ndarray, valid_mask: np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        array = np.asarray(values, dtype=float)
+        if array.ndim != 2 or array.shape[1] != self.n_features:
+            raise ValueError(
+                f"expected a 2-D array with {self.n_features} features, got {array.shape}"
+            )
+        if valid_mask is None:
+            mask = np.isfinite(array)
+        else:
+            mask = np.asarray(valid_mask, dtype=bool)
+            if mask.shape != array.shape:
+                raise ValueError("valid_mask must have the same shape as values")
+        masked = np.array(array, dtype=float, copy=True)
+        masked[~mask] = np.nan
+        return masked, mask
+
+    def _apply_rules(self, values: np.ndarray) -> np.ndarray:
+        transformed = np.full_like(values, np.nan, dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            for index, name in enumerate(self.feature_names):
+                column = values[:, index]
+                rule = self.rules[name]
+                if rule["unit_transform"] == "sec_to_hour":
+                    column = column / 3600.0
+                elif rule["unit_transform"] == "sec_to_minute":
+                    column = column / 60.0
+                elif rule["unit_transform"] != "identity":
+                    raise ValueError(f"unknown unit transform: {rule['unit_transform']}")
+                if rule["nonlinear"] == "log1p":
+                    column = np.log1p(column)
+                elif rule["nonlinear"] != "identity":
+                    raise ValueError(f"unknown nonlinear transform: {rule['nonlinear']}")
+                transformed[:, index] = column
+        return transformed
+
+    def fit(
+        self, values: np.ndarray, valid_mask: np.ndarray | None = None
+    ) -> "FeatureScaler":
+        masked, _ = self._validate_inputs(values, valid_mask)
+        transformed = self._apply_rules(masked)
+        self._transformed_train = transformed.copy()
+        self.robust_center = np.zeros(self.n_features, dtype=float)
+        self.robust_scale = np.ones(self.n_features, dtype=float)
+        robust_values = transformed.copy()
+        self.all_missing_fallback = [False] * self.n_features
+
+        for index, name in enumerate(self.feature_names):
+            finite = np.isfinite(transformed[:, index])
+            if not np.any(finite):
+                self.all_missing_fallback[index] = True
+                continue
+            if self.rules[name]["robust"]:
+                present = transformed[finite, index]
+                center = float(np.median(present))
+                q25, q75 = np.percentile(present, [25.0, 75.0])
+                scale = float(q75 - q25)
+                self.robust_center[index] = center
+                self.robust_scale[index] = scale if np.isfinite(scale) and scale > 0 else 1.0
+                robust_values[finite, index] = (
+                    present - self.robust_center[index]
+                ) / self.robust_scale[index]
+
+        self.imputer_median = np.zeros(self.n_features, dtype=float)
+        filled = robust_values.copy()
+        for index in range(self.n_features):
+            finite = np.isfinite(robust_values[:, index])
+            if np.any(finite):
+                self.imputer_median[index] = float(np.median(robust_values[finite, index]))
+            else:
+                self.all_missing_fallback[index] = True
+            filled[~finite, index] = self.imputer_median[index]
+
+        standard = StandardScaler().fit(filled)
+        self.standard_mean = standard.mean_.astype(float)
+        self.standard_scale = standard.scale_.astype(float)
+        self.standard_scale[~np.isfinite(self.standard_scale) | (self.standard_scale == 0)] = 1.0
+        self.fitted = True
+        return self
+
+    def _transform_to_filled(
+        self, values: np.ndarray, valid_mask: np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if not self.fitted:
+            raise RuntimeError("FeatureScaler must be fitted before transform")
+        masked, supplied_mask = self._validate_inputs(values, valid_mask)
+        transformed = self._apply_rules(masked)
+        robust = transformed.copy()
+        for index, name in enumerate(self.feature_names):
+            if self.rules[name]["robust"]:
+                finite = np.isfinite(robust[:, index])
+                robust[finite, index] = (
+                    robust[finite, index] - self.robust_center[index]
+                ) / self.robust_scale[index]
+        missing = ~supplied_mask | ~np.isfinite(robust)
+        filled = robust.copy()
+        for index in range(self.n_features):
+            filled[missing[:, index], index] = self.imputer_median[index]
+        return filled, missing
+
+    def transform(
+        self,
+        values: np.ndarray,
+        valid_mask: np.ndarray | None = None,
+        *,
+        return_diagnostics: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, dict[str, Any]]:
+        filled, missing = self._transform_to_filled(values, valid_mask)
+        output = (filled - self.standard_mean) / self.standard_scale
+        if not return_diagnostics:
+            return output
+        return output, {
+            "missing_mask": missing,
+            "all_missing_fallback": list(self.all_missing_fallback),
+        }
+
+    def fit_transform(
+        self, values: np.ndarray, valid_mask: np.ndarray | None = None
+    ) -> np.ndarray:
+        return self.fit(values, valid_mask).transform(values, valid_mask)  # type: ignore[return-value]
+
+    def explain(
+        self, values: np.ndarray, valid_mask: np.ndarray | None = None
+    ) -> dict[str, np.ndarray]:
+        """返回单条输入经过各阶段的数值，仅用于显式诊断，不重新拟合。"""
+
+        if not self.fitted:
+            raise RuntimeError("FeatureScaler must be fitted before explain")
+        raw = np.asarray(values, dtype=float).reshape(1, -1)
+        mask_array = None if valid_mask is None else np.asarray(valid_mask, dtype=bool).reshape(1, -1)
+        masked, supplied_mask = self._validate_inputs(raw, mask_array)
+        unit_transformed = self._apply_rules(masked)
+        robust = unit_transformed.copy()
+        for index, name in enumerate(self.feature_names):
+            if self.rules[name]["robust"]:
+                finite = np.isfinite(robust[:, index])
+                robust[finite, index] = (
+                    robust[finite, index] - self.robust_center[index]
+                ) / self.robust_scale[index]
+        filled, missing = self._transform_to_filled(raw, mask_array)
+        standardized = (filled - self.standard_mean) / self.standard_scale
+        return {
+            "raw": raw[0],
+            "valid_mask": supplied_mask[0],
+            "unit_transformed": unit_transformed[0],
+            "robust_transformed": robust[0],
+            "imputed": filled[0],
+            "standardized": standardized[0],
+            "missing_mask": missing[0],
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        if not self.fitted:
+            raise RuntimeError("cannot serialize an unfitted FeatureScaler")
+        return {
+            "version": self.version,
+            "feature_names": list(self.feature_names),
+            "rules": self.rules,
+            "robust_center": self.robust_center.tolist(),
+            "robust_scale": self.robust_scale.tolist(),
+            "imputer_median": self.imputer_median.tolist(),
+            "standard_mean": self.standard_mean.tolist(),
+            "standard_scale": self.standard_scale.tolist(),
+            "all_missing_fallback": list(self.all_missing_fallback),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "FeatureScaler":
+        scaler = cls(feature_names=payload["feature_names"], rules=payload["rules"])
+        scaler.version = str(payload.get("version", SCALER_VERSION))
+        for field in ("robust_center", "robust_scale", "imputer_median", "standard_mean", "standard_scale"):
+            setattr(scaler, field, np.asarray(payload[field], dtype=float))
+        scaler.all_missing_fallback = [bool(x) for x in payload["all_missing_fallback"]]
+        scaler.fitted = True
+        return scaler
+
+    def save(self, path: str | Path) -> None:
+        Path(path).write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: str | Path) -> "FeatureScaler":
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls.from_dict(payload)
+
+
+def _load_serialized_scaler(path: str | Path) -> FeatureScaler:
+    import joblib
+
+    payload = joblib.load(path)
+    if isinstance(payload, dict) and "preprocessor" in payload:
+        payload = payload["preprocessor"]
+    # 直接执行 `python feature_scaling.py` 时，本文件类名为 `__main__.FeatureScaler`；
+    # joblib 中的同一类会以 `feature_scaling.FeatureScaler` 反序列化，因此同时接受
+    # 这两个模块身份，但仍检查必要的拟合接口和状态。
+    if not isinstance(payload, FeatureScaler) and not (
+        payload.__class__.__name__ == "FeatureScaler"
+        and hasattr(payload, "transform")
+        and bool(getattr(payload, "fitted", False))
+    ):
+        raise TypeError(f"unsupported preprocessor file: {path}")
+    return payload
+
+
+def _load_feature_row(feature_path: str | Path, record_id: str) -> tuple[np.ndarray, np.ndarray]:
+    import json as _json
+    import pandas as pd
+
+    frame = pd.read_csv(feature_path, sep="\t", dtype=str, keep_default_na=False)
+    rows = frame.loc[frame["record_id"] == record_id]
+    if len(rows) != 1:
+        raise KeyError(f"expected one frozen feature row for {record_id}, found {len(rows)}")
+    row = rows.iloc[0]
+    values = _json.loads(row["values"])
+    valid = _json.loads(row["valid_mask"])
+    return (
+        np.asarray([np.nan if x is None else float(x) for x in values], dtype=float),
+        np.asarray(valid, dtype=bool),
+    )
+
+
+def _print_vector(label: str, values: np.ndarray, names: Sequence[str]) -> None:
+    print(label)
+    for name, value in zip(names, values):
+        print(f"  {name}: {value!r}")
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Inspect a fitted CAISR20 scaler")
+    parser.add_argument("--preprocessor", required=True, help="preprocessing.joblib or model.sav")
+    parser.add_argument("--features", default="feature_extraction/features/caisr/caisr.tsv")
+    parser.add_argument("--record-id")
+    parser.add_argument("--distribution", action="store_true")
+    parser.add_argument(
+        "--demographics",
+        default="/database2/physionet2026_kaggle/data2/demographics.csv",
+    )
+    args = parser.parse_args(argv)
+    if not args.record_id and not args.distribution:
+        parser.error("provide --record-id or --distribution")
+    scaler = _load_serialized_scaler(args.preprocessor)
+    if args.record_id:
+        values, valid = _load_feature_row(args.features, args.record_id)
+        explained = scaler.explain(values, valid)
+        print(f"record_id: {args.record_id}")
+        for label, key in (
+            ("raw", "raw"),
+            ("valid_mask", "valid_mask"),
+            ("unit_transformed", "unit_transformed"),
+            ("robust_transformed", "robust_transformed"),
+            ("imputed", "imputed"),
+            ("standardized", "standardized"),
+        ):
+            _print_vector(label, explained[key], scaler.feature_names)
+    if args.distribution:
+        from train_lr import load_caisr_dataset
+
+        dataset = load_caisr_dataset(args.features, args.demographics)
+        transformed = scaler.transform(dataset.values, dataset.valid_mask)
+        print(f"distribution_records: {len(dataset.records)}")
+        for index, name in enumerate(scaler.feature_names):
+            column = transformed[:, index]
+            print(
+                f"{name}\tfinite={np.isfinite(column).sum()}"
+                f"\tmin={np.min(column):.9g}\tmedian={np.median(column):.9g}"
+                f"\tmax={np.max(column):.9g}"
+            )
+
+
+if __name__ == "__main__":
+    main()
+

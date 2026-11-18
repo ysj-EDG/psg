@@ -33,7 +33,7 @@ else:
 
 BRANCH_NAME = "caisr"
 PLANNED_TIME_SCALES = ("night",)
-FEATURE_VERSION = "canonical_v1"
+FEATURE_VERSION = "canonical_v2_sleep_event_range"
 EPOCH_SEC = 30.0
 AROUSAL_FS = 2.0
 EVENT_FS = 1.0
@@ -173,6 +173,98 @@ def _set_feature(values: np.ndarray, valid: np.ndarray, reasons: np.ndarray, ind
         reasons[index] = reason or InvalidReason.INVALID_VALUE.value
 
 
+def _tst_support_group(tst_sec: float) -> str:
+    """返回仅用于诊断的 TST 支持分层；不改变任何特征有效性。"""
+    if not np.isfinite(tst_sec) or tst_sec <= 0:
+        return "TST=0"
+    if tst_sec < 300.0:
+        return "0<TST<5min"
+    if tst_sec < 1800.0:
+        return "5min<=TST<30min"
+    return "TST>=30min"
+
+
+def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    ordered = sorted((float(start), float(end)) for start, end in intervals if end > start)
+    if not ordered:
+        return []
+    merged: list[tuple[float, float]] = [ordered[0]]
+    for start, end in ordered[1:]:
+        previous_start, previous_end = merged[-1]
+        if start <= previous_end:
+            merged[-1] = (previous_start, max(previous_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _sleep_intervals(stage: np.ndarray, timebase: Mapping[str, Any] | None, epoch_duration_sec: float) -> list[tuple[float, float]]:
+    """按 PSG-relative timebase 返回合并后的 N1/N2/N3/REM 区间。"""
+    values = _as_1d(stage, np.int64)
+    starts: np.ndarray
+    ends: np.ndarray
+    try:
+        starts = np.asarray(timebase["epoch_start_sec"], dtype=float).reshape(-1) if timebase is not None else np.empty(0)
+        ends = np.asarray(timebase["epoch_end_sec"], dtype=float).reshape(-1) if timebase is not None else np.empty(0)
+    except (KeyError, TypeError, ValueError):
+        starts = np.empty(0)
+        ends = np.empty(0)
+    if len(starts) != len(values) or len(ends) != len(values) or not np.isfinite(starts).all() or not np.isfinite(ends).all():
+        starts = np.arange(len(values), dtype=float) * epoch_duration_sec
+        ends = starts + epoch_duration_sec
+    return _merge_intervals([
+        (float(start), float(end))
+        for value, start, end in zip(values, starts, ends)
+        if int(value) in _SLEEP_CODES and end > start
+    ])
+
+
+def _sleep_overlap_duration(start_sec: float, end_sec: float, sleep_intervals: list[tuple[float, float]]) -> float:
+    return float(sum(max(0.0, min(end_sec, sleep_end) - max(start_sec, sleep_start)) for sleep_start, sleep_end in sleep_intervals if sleep_start < end_sec and sleep_end > start_sec))
+
+
+def _annotation_support_complete(values: Any, valid_codes: tuple[int, ...], sleep_intervals: list[tuple[float, float]], fs: float) -> bool:
+    """确认所有需要用于事件特征的 Sleep 样本均有有效 categorical annotation。"""
+    array = _as_1d(values, float)
+    valid = np.isfinite(array) & np.isin(array, valid_codes)
+    coverage_end = len(array) / fs
+    for start_sec, end_sec in sleep_intervals:
+        if start_sec < -1e-9 or end_sec > coverage_end + 1e-9:
+            return False
+        start_index = max(0, int(np.ceil(start_sec * fs - 1e-9)))
+        end_index = min(len(array), int(np.ceil(end_sec * fs - 1e-9)))
+        if end_index > start_index and not bool(valid[start_index:end_index].all()):
+            return False
+    return True
+
+
+def _sleep_event_summary(
+    segments: list[tuple[int, int, int]],
+    fs: float,
+    sleep_intervals: list[tuple[float, float]],
+    values: Any,
+    valid_codes: tuple[int, ...],
+    source_available: bool,
+    tst_hours: float,
+) -> dict[str, Any]:
+    if not source_available:
+        return {"status": "unavailable", "count": 0, "duration_sec": 0.0, "support_complete": False}
+    if not np.isfinite(tst_hours) or tst_hours <= 0:
+        return {"status": "no_tst", "count": 0, "duration_sec": 0.0, "support_complete": False}
+    if not _annotation_support_complete(values, valid_codes, sleep_intervals, fs):
+        return {"status": "insufficient", "count": 0, "duration_sec": 0.0, "support_complete": False}
+    count = 0
+    duration_sec = 0.0
+    for segment in segments:
+        start, end = segment[:2]
+        overlap = _sleep_overlap_duration(start / fs, end / fs, sleep_intervals)
+        if overlap > 0:
+            # 一个原始 event 即使跨越多个 Sleep 区间，也只计数一次。
+            count += 1
+            duration_sec += overlap
+    return {"status": "ok", "count": count, "duration_sec": float(duration_sec), "support_complete": True}
+
+
 def _compute_features(
     stage: Any,
     stage_probability: Any,
@@ -183,6 +275,7 @@ def _compute_features(
     *,
     availability: Mapping[str, bool] | None = None,
     epoch_duration_sec: float = EPOCH_SEC,
+    timebase: Mapping[str, Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """对已读入的 canonical annotation 数组计算 CAISR20。"""
     available = {"stage": True, "stage_probability": True, "arousal": True, "respiratory": True, "limb": True}
@@ -194,7 +287,7 @@ def _compute_features(
         probabilities = np.empty((0, 5), dtype=np.float32)
     probability_valid = _as_1d(stage_probability_valid, bool)
     values, valid, reasons = _empty_outputs()
-    diagnostics: dict[str, Any] = {"tst_sec": float("nan"), "sleep_bout_lengths_epochs": []}
+    diagnostics: dict[str, Any] = {"tst_sec": 0.0, "sleep_bout_lengths_epochs": []}
 
     stage_valid = available["stage"] & np.isin(stage_array, _STAGE_CODES)
     valid_stage_count = int(np.count_nonzero(stage_valid))
@@ -229,47 +322,77 @@ def _compute_features(
         for index in range(11):
             _set_feature(values, valid, reasons, index, float("nan"), reason)
 
+    tst_sec = float(diagnostics["tst_sec"])
+    diagnostics["low_tst_support"] = bool(np.isfinite(tst_sec) and tst_sec < 1800.0)
+    diagnostics["tst_support_group"] = _tst_support_group(tst_sec)
     entropy, rows_used = _stage_probability_entropy(probabilities, probability_valid, available["stage_probability"])
     diagnostics["stage_probability_rows_used"] = rows_used
     _set_feature(values, valid, reasons, 11, entropy, None if np.isfinite(entropy) else (InvalidReason.CAISR_UNAVAILABLE.value if not available["stage_probability"] else InvalidReason.COVERAGE_INSUFFICIENT.value))
 
-    tst_value = diagnostics["tst_sec"]
-    tst_hours = float(tst_value) / 3600.0 if np.isfinite(tst_value) and tst_value > 0 else 0.0
+    tst_hours = tst_sec / 3600.0 if np.isfinite(tst_sec) and tst_sec > 0 else 0.0
+    sleep_intervals = _sleep_intervals(stage_array, timebase, epoch_duration_sec)
     arousal_segments = _segment_binary(np.asarray(arousal).reshape(-1)) if available["arousal"] else []
     respiratory_segments = _segment_multiclass(np.asarray(respiratory).reshape(-1), (1, 2, 3, 4, 5)) if available["respiratory"] else []
     limb_segments = _segment_multiclass(np.asarray(limb).reshape(-1), (1, 2)) if available["limb"] else []
+    plm_segments = _segment_multiclass(np.asarray(limb).reshape(-1), (2,)) if available["limb"] else []
     diagnostics.update({
         "arousal_segment_count": len(arousal_segments),
         "respiratory_segment_count": len(respiratory_segments),
-        "limb_periodic_segment_count": sum(code == 2 for _, _, code in limb_segments),
+        "limb_segment_count": len(limb_segments),
+        "limb_periodic_segment_count": len(plm_segments),
     })
 
-    def _event_metrics(indexes: tuple[int, int, int], segments: list[Any], fs: float, source_available: bool) -> None:
+    def _apply_event_metrics(
+        name: str,
+        indexes: tuple[int, int, int],
+        segments: list[tuple[int, int, int]],
+        fs: float,
+        valid_codes: tuple[int, ...],
+        source_available: bool,
+        source_values: Any,
+    ) -> None:
         index, burden, mean_duration = indexes
-        if not source_available:
+        summary = _sleep_event_summary(segments, fs, sleep_intervals, source_values, valid_codes, source_available, tst_hours)
+        diagnostics[f"{name}_sleep_event_count"] = int(summary["count"])
+        diagnostics[f"{name}_sleep_event_duration_sec"] = float(summary["duration_sec"])
+        diagnostics[f"{name}_annotation_support_complete"] = bool(summary["support_complete"])
+        if summary["status"] == "unavailable":
             for feature_index in indexes:
                 _set_feature(values, valid, reasons, feature_index, float("nan"), InvalidReason.CAISR_UNAVAILABLE.value)
             return
-        if tst_hours <= 0:
+        if summary["status"] in {"no_tst", "insufficient"}:
+            reason = InvalidReason.COVERAGE_INSUFFICIENT.value
             for feature_index in indexes:
-                _set_feature(values, valid, reasons, feature_index, float("nan"), InvalidReason.COVERAGE_INSUFFICIENT.value)
+                _set_feature(values, valid, reasons, feature_index, float("nan"), reason)
             return
-        durations = [(segment[1] - segment[0]) / fs for segment in segments]
-        _set_feature(values, valid, reasons, index, len(segments) / tst_hours)
-        _set_feature(values, valid, reasons, burden, sum(durations) / float(tst_value))
-        _set_feature(values, valid, reasons, mean_duration, float(np.mean(durations)) if durations else float("nan"), None if durations else InvalidReason.COVERAGE_INSUFFICIENT.value)
+        count = int(summary["count"])
+        duration_sec = float(summary["duration_sec"])
+        _set_feature(values, valid, reasons, index, count / tst_hours)
+        _set_feature(values, valid, reasons, burden, duration_sec / tst_sec)
+        _set_feature(values, valid, reasons, mean_duration, duration_sec / count if count else float("nan"), None if count else InvalidReason.COVERAGE_INSUFFICIENT.value)
 
-    _event_metrics((12, 13, 14), arousal_segments, AROUSAL_FS, available["arousal"])
-    _event_metrics((15, 16, 17), respiratory_segments, EVENT_FS, available["respiratory"])
-    if not available["limb"]:
+    _apply_event_metrics("arousal", (12, 13, 14), arousal_segments, AROUSAL_FS, (0, 1), available["arousal"], arousal)
+    _apply_event_metrics("respiratory", (15, 16, 17), respiratory_segments, EVENT_FS, (0, 1, 2, 3, 4, 5), available["respiratory"], respiratory)
+
+    limb_summary = _sleep_event_summary(limb_segments, EVENT_FS, sleep_intervals, limb, (0, 1, 2), available["limb"], tst_hours)
+    plm_summary = _sleep_event_summary(plm_segments, EVENT_FS, sleep_intervals, limb, (0, 1, 2), available["limb"], tst_hours)
+    diagnostics.update({
+        "limb_sleep_event_count": int(limb_summary["count"]),
+        "limb_sleep_event_duration_sec": float(limb_summary["duration_sec"]),
+        "limb_annotation_support_complete": bool(limb_summary["support_complete"]),
+        "plm_sleep_event_count": int(plm_summary["count"]),
+        "plm_sleep_event_duration_sec": float(plm_summary["duration_sec"]),
+        "plm_annotation_support_complete": bool(plm_summary["support_complete"]),
+    })
+    if limb_summary["status"] == "unavailable":
         _set_feature(values, valid, reasons, 18, float("nan"), InvalidReason.CAISR_UNAVAILABLE.value)
         _set_feature(values, valid, reasons, 19, float("nan"), InvalidReason.CAISR_UNAVAILABLE.value)
-    elif tst_hours <= 0:
+    elif limb_summary["status"] in {"no_tst", "insufficient"}:
         _set_feature(values, valid, reasons, 18, float("nan"), InvalidReason.COVERAGE_INSUFFICIENT.value)
         _set_feature(values, valid, reasons, 19, float("nan"), InvalidReason.COVERAGE_INSUFFICIENT.value)
     else:
-        _set_feature(values, valid, reasons, 18, len(limb_segments) / tst_hours)
-        _set_feature(values, valid, reasons, 19, sum(code == 2 for _, _, code in limb_segments) / tst_hours)
+        _set_feature(values, valid, reasons, 18, limb_summary["count"] / tst_hours)
+        _set_feature(values, valid, reasons, 19, plm_summary["count"] / tst_hours)
 
     return values.astype(np.float32, copy=False), valid, reasons, diagnostics
 
@@ -306,8 +429,8 @@ def extract(context: Any, config: Mapping[str, Any] | None = None) -> BranchResu
     del config
     arrays = {name: np.asarray(context.caisr_dataset(name)[...]) for name in ("stage", "stage_probability", "stage_probability_valid", "arousal", "respiratory", "limb")}
     availability = _source_availability(context)
-    values, valid, reasons, diagnostics = _compute_features(**arrays, availability=availability)
     timebase = context.timebase()
+    values, valid, reasons, diagnostics = _compute_features(**arrays, availability=availability, timebase=timebase)
     diagnostics.update({
         "record_id": context.record.record_id,
         "site": context.record.site,

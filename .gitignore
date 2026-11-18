@@ -34,3 +34,19 @@ cache_print.txt
 waveform_record_output/
 records/
 HDF5_distribution/
+
+# Files intentionally kept local for the current model-flow push.
+feature_extraction/check/caisr/
+feature_extraction/features/
+output/caisr/run_info.json
+output/caisr/summary.tsv
+tests/test_cache_profile.py
+tests/test_cache_record.py
+tests/test_caisr_distribution.py
+tests/test_caisr_model_inputs.py
+tests/test_feature_scaling.py
+tests/test_loso.py
+tests/test_official_adaptation.py
+tests/test_train_lr.py
+tests/test_waveform_qc.py
+tests/test_waveform_qc_writer.py
