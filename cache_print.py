@@ -15,6 +15,12 @@ import numpy as np
 SMALL_DATASET_LIMIT = 5000
 BLOCK_ELEMENTS = 1_000_000
 STAGE_PROBABILITY_NAMES = ("N3", "N2", "N1", "REM", "Wake")
+QC_MASK_NAMES = (
+    "channel_invalid_5s",
+    "channel_flat_5s",
+    "channel_extreme_5s",
+)
+MODALITY_NAMES = ("eeg", "eog", "ecg", "emg", "resp", "spo2")
 
 
 def _format_value(value: Any) -> str:
@@ -237,6 +243,97 @@ def _quality_details(lines: list[str], handle: h5py.File, path: str, dataset: h5
                 lines.append(f"    {name}: mean={_format_value(sums[channel] / finite_counts[channel] if finite_counts[channel] else np.nan)}")
 
 
+def _append_qc_mask_details(lines: list[str], handle: h5py.File) -> None:
+    """输出单个 HDF5 record 的 invalid/flat/extreme 实际掩码内容。
+
+    三类 QC 数据集通常是 ``(epoch, channel, subwindow)``，其中每个
+    subwindow 对应一个 5 秒窗口。这里不读取 waveform，只逐 dataset、逐
+    chunk 扫描 QC 掩码，并把每个通道为 True 的 ``(epoch, subwindow)``
+    位置完整列出；没有列出的窗口值即为 False。
+    """
+
+    lines.append("QC MASK CONTENTS")
+    lines.append("说明: true_positions 列出值为 True 的(epoch, subwindow)；subwindow=0..5对应每个epoch内的5秒窗口。")
+    for modality in MODALITY_NAMES:
+        lines.append(f"modality: {modality}")
+        channel_count = 0
+        try:
+            present_path = f"quality/channel_present/{modality}"
+            if present_path in handle:
+                channel_count = int(handle[present_path].shape[0])
+            else:
+                signal_path = f"signals/{modality}"
+                if signal_path in handle and handle[signal_path].ndim >= 2:
+                    channel_count = int(handle[signal_path].shape[1])
+            names = _channel_names(handle, modality, channel_count)
+        except Exception as exc:
+            lines.append(f"  ERROR channel metadata: {type(exc).__name__}: {exc}")
+            names = []
+
+        for qc_name in QC_MASK_NAMES:
+            path = f"quality/{qc_name}/{modality}"
+            if path not in handle:
+                lines.append(f"  {path}: MISSING")
+                continue
+            dataset = handle[path]
+            lines.append(f"  {path}:")
+            lines.append(f"    shape: {dataset.shape}")
+            lines.append(f"    dtype: {dataset.dtype}")
+            if dataset.ndim == 0:
+                value = bool(dataset[()])
+                lines.append(f"    value: {value}")
+                continue
+
+            channels = int(dataset.shape[1]) if dataset.ndim >= 2 else 1
+            if not names or len(names) != channels:
+                candidate_names = _channel_names(handle, modality, channels)
+                names = candidate_names if len(candidate_names) == channels else [
+                    f"channel_{index}" for index in range(channels)
+                ]
+            true_counts = np.zeros(channels, dtype=np.int64)
+            total_counts = np.zeros(channels, dtype=np.int64)
+            true_positions: list[list[tuple[int, ...]]] = [[] for _ in range(channels)]
+
+            # 沿第一个轴分块读取，避免把异常大的 QC dataset 一次性载入内存。
+            for selection in _dataset_slices(dataset):
+                values = np.asarray(_read_slice(dataset, selection), dtype=bool)
+                if dataset.ndim == 1:
+                    values = values.reshape(-1, 1)
+                for channel in range(channels):
+                    channel_values = values[:, channel, ...] if dataset.ndim >= 2 else values[:, 0]
+                    flat = channel_values.reshape(-1)
+                    true_counts[channel] += int(np.count_nonzero(flat))
+                    total_counts[channel] += int(flat.size)
+                    if dataset.ndim == 3:
+                        for row, subwindows in enumerate(channel_values):
+                            for subwindow in np.flatnonzero(subwindows):
+                                epoch = int(selection[0].start or 0) + row
+                                true_positions[channel].append((epoch, int(subwindow)))
+                    elif dataset.ndim == 2:
+                        for row in np.flatnonzero(channel_values):
+                            epoch = int(selection[0].start or 0) + int(row)
+                            true_positions[channel].append((epoch,))
+                    else:
+                        for offset in np.flatnonzero(flat):
+                            true_positions[channel].append((int(selection[0].start or 0) + int(offset),))
+
+            for channel, name in enumerate(names):
+                fraction = (true_counts[channel] / total_counts[channel]) if total_counts[channel] else 0.0
+                if dataset.ndim == 3:
+                    positions = ", ".join(
+                        f"(epoch={epoch}, subwindow={subwindow})"
+                        for epoch, subwindow in true_positions[channel]
+                    )
+                else:
+                    positions = ", ".join(str(position) for position in true_positions[channel])
+                lines.append(f"    {name}:")
+                lines.append(f"      true_count: {int(true_counts[channel])}")
+                lines.append(f"      total_count: {int(total_counts[channel])}")
+                lines.append(f"      true_fraction: {fraction}")
+                lines.append(f"      true_positions: [{positions}]")
+        lines.append("")
+
+
 def _caisr_details(lines: list[str], dataset_path: str, dataset: h5py.Dataset) -> None:
     name = dataset_path.rsplit("/", 1)[-1]
     if not dataset_path.startswith("/annotations/caisr/"):
@@ -290,7 +387,7 @@ def _inspect_dataset(lines: list[str], handle: h5py.File, path: str, dataset: h5
     lines.append("")
 
 
-def inspect_cache(input_path: Path, output_path: Path) -> None:
+def inspect_cache(input_path: Path, output_path: Path, *, include_qc: bool = False) -> list[str]:
     resolved_input = input_path.expanduser().resolve()
     resolved_output = output_path.expanduser().resolve()
     if resolved_input == resolved_output:
@@ -325,19 +422,35 @@ def inspect_cache(input_path: Path, output_path: Path) -> None:
                 lines.append("")
 
         handle.visititems(visitor)
+        if include_qc:
+            _append_qc_mask_details(lines, handle)
     lines.append("Inspection complete")
     lines.append(f"Input: {resolved_input}")
     lines.append(f"Report: {resolved_output}")
     resolved_output.parent.mkdir(parents=True, exist_ok=True)
     resolved_output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return lines
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("hdf5_path", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--print-qc",
+        "--qc",
+        action="store_true",
+        help="在终端和报告中打印 invalid/flat/extreme 三类逐5秒窗口掩码",
+    )
     args = parser.parse_args()
-    inspect_cache(args.hdf5_path, args.output)
+    lines = inspect_cache(args.hdf5_path, args.output, include_qc=args.print_qc)
+    if args.print_qc:
+        try:
+            start = lines.index("QC MASK CONTENTS")
+            end = lines.index("Inspection complete", start)
+            print("\n".join(lines[start:end]).rstrip())
+        except ValueError:
+            print("QC MASK CONTENTS unavailable")
     print("Inspection complete")
     print(f"Input: {args.hdf5_path.expanduser().resolve()}")
     print(f"Report: {args.output.expanduser().resolve()}")
@@ -353,3 +466,13 @@ if __name__ == "__main__":
 # /database/home/gaohaojie/.conda/envs/sleepfm_env/bin/python cache_print.py \
 #   waveform_cache/I0002/sub-I0002150002662_ses-1.h5 \
 #   --output cache_print.txt
+
+
+# cd /database/home/gaohaojie/workspace/psg
+
+# PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
+# /database/home/gaohaojie/.conda/envs/sleepfm_env/bin/python \
+# cache_print.py \
+# waveform_cache/I0002/sub-I0002150002662_ses-1.h5 \
+# --output cache_print.txt \
+# --print-qc

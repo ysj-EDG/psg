@@ -36,6 +36,31 @@ CAISR20_FEATURE_NAMES = (
 
 SCALER_VERSION = "caisr_v2_train_fold_scaler_v1"
 
+EEG18_FEATURE_NAMES = (
+    "eeg_n3_frontal_so_log_power",
+    "eeg_n3_frontal_delta_log_power",
+    "eeg_n2_frontal_swa_log_power",
+    "eeg_n3_frontal_so_delta_log_ratio",
+    "eeg_n3_frontal_slow_fast_log_ratio",
+    "eeg_n2_central_sigma_relative_power",
+    "eeg_n2_frontal_slow_sigma_relative_power",
+    "eeg_n2_central_fast_sigma_relative_power",
+    "eeg_n2_occipital_fast_sigma_relative_power",
+    "eeg_rem_occipital_slowing_log_ratio",
+    "eeg_rem_central_slowing_log_ratio",
+    "eeg_rem_frontal_slowing_log_ratio",
+    "eeg_rem_occipital_theta_alpha_log_ratio",
+    "eeg_n3_frontal_occipital_swa_log_gradient",
+    "eeg_n2_frontal_occipital_fast_sigma_log_gradient",
+    "eeg_rem_occipital_frontal_slowing_difference",
+    "eeg_n3_frontal_swa_left_right_log_asymmetry",
+    "eeg_n2_central_sigma_left_right_log_asymmetry",
+)
+
+EEG_SCALER_VERSION = "eeg18_identity_train_fold_scaler_v1"
+FUSION_SCALER_VERSION = "caisr20_eeg18_train_fold_scaler_v1"
+EEG_SUBSET_SCALER_VERSION = "caisr20_eeg_subset_train_fold_scaler_v1"
+
 
 def _make_rules() -> dict[str, dict[str, Any]]:
     rules: dict[str, dict[str, Any]] = {}
@@ -61,6 +86,43 @@ def _make_rules() -> dict[str, dict[str, Any]]:
 DEFAULT_RULES = _make_rules()
 
 
+def _identity_rules(feature_names: Sequence[str]) -> dict[str, dict[str, Any]]:
+    return {
+        name: {"unit_transform": "identity", "nonlinear": "identity", "robust": False}
+        for name in feature_names
+    }
+
+
+def rules_for_feature_names(
+    feature_names: Sequence[str],
+) -> tuple[dict[str, dict[str, Any]], str]:
+    """Return the fixed rule set for one approved experiment layout."""
+
+    names = list(feature_names)
+    if names == list(CAISR20_FEATURE_NAMES):
+        return {name: dict(rule) for name, rule in DEFAULT_RULES.items()}, SCALER_VERSION
+    if names == list(EEG18_FEATURE_NAMES):
+        return _identity_rules(EEG18_FEATURE_NAMES), EEG_SCALER_VERSION
+    if names == list(CAISR20_FEATURE_NAMES + EEG18_FEATURE_NAMES):
+        rules = {name: dict(rule) for name, rule in DEFAULT_RULES.items()}
+        rules.update(_identity_rules(EEG18_FEATURE_NAMES))
+        return rules, FUSION_SCALER_VERSION
+    caisr_prefix = list(CAISR20_FEATURE_NAMES)
+    eeg_suffix = names[len(caisr_prefix):] if names[:len(caisr_prefix)] == caisr_prefix else []
+    if names[:len(caisr_prefix)] == caisr_prefix and eeg_suffix:
+        eeg_order = {name: index for index, name in enumerate(EEG18_FEATURE_NAMES)}
+        if all(name in eeg_order for name in eeg_suffix) and eeg_suffix == sorted(eeg_suffix, key=eeg_order.get):
+            rules = {name: dict(rule) for name, rule in DEFAULT_RULES.items()}
+            rules.update(_identity_rules(eeg_suffix))
+            return rules, EEG_SUBSET_SCALER_VERSION
+    raise ValueError("feature names/order must match CAISR20, EEG18, or CAISR20+EEG18 or an approved CAISR20+EEG subset")
+
+
+def build_feature_scaler(feature_names: Sequence[str]) -> "FeatureScaler":
+    rules, version = rules_for_feature_names(feature_names)
+    return FeatureScaler(feature_names=feature_names, rules=rules, version=version)
+
+
 class FeatureScaler:
     """按固定 CAISR20 顺序执行 train-fold-only 的缺失填补和标准化。
 
@@ -72,15 +134,15 @@ class FeatureScaler:
         self,
         feature_names: Sequence[str] | None = None,
         rules: Mapping[str, Mapping[str, Any]] | None = None,
+        version: str | None = None,
     ) -> None:
         names = list(CAISR20_FEATURE_NAMES if feature_names is None else feature_names)
-        if names != list(CAISR20_FEATURE_NAMES):
-            raise ValueError("CAISR20 feature names/order must match the frozen schema")
+        default_rules, default_version = rules_for_feature_names(names)
         self.feature_names = names
         self.rules = {
-            name: dict((rules or DEFAULT_RULES)[name]) for name in self.feature_names
+            name: dict((rules or default_rules)[name]) for name in self.feature_names
         }
-        self.version = SCALER_VERSION
+        self.version = default_version if version is None else str(version)
         self.fitted = False
 
     @property
@@ -256,8 +318,11 @@ class FeatureScaler:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "FeatureScaler":
-        scaler = cls(feature_names=payload["feature_names"], rules=payload["rules"])
-        scaler.version = str(payload.get("version", SCALER_VERSION))
+        scaler = cls(
+            feature_names=payload["feature_names"],
+            rules=payload["rules"],
+            version=str(payload.get("version", SCALER_VERSION)),
+        )
         for field in ("robust_center", "robust_scale", "imputer_median", "standard_mean", "standard_scale"):
             setattr(scaler, field, np.asarray(payload[field], dtype=float))
         scaler.all_missing_fallback = [bool(x) for x in payload["all_missing_fallback"]]
