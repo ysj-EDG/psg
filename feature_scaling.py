@@ -36,6 +36,24 @@ CAISR20_FEATURE_NAMES = (
 
 SCALER_VERSION = "caisr_v2_train_fold_scaler_v1"
 
+HRV_A14_FEATURE_NAMES = (
+    "ecg_hrv_median_nn_w300_equal_mean",
+    "ecg_hrv_mcvnn_w300_equal_mean",
+    "ecg_hrv_cvnn_w300_equal_mean",
+    "ecg_hrv_cvsd_w300_equal_mean",
+    "ecg_hrv_pnn20_w300_equal_mean",
+    "ecg_hrv_lf_power_w300_equal_mean",
+    "ecg_hrv_hf_power_w300_equal_mean",
+    "ecg_hrv_hf_relative_lfhf_w300_equal_mean",
+    "ecg_hrv_sd1_sd2_w300_equal_mean",
+    "ecg_hrv_symbolic_equalprob4_0v_w300_equal_mean",
+    "ecg_hrv_symbolic_equalprob4_2uv_w300_equal_mean",
+    "ecg_hrv_mean_nn_w300_equal_mean",
+    "ecg_hrv_sdnn_w300_equal_mean",
+    "ecg_hrv_rmssd_w300_equal_mean",
+)
+HRV_A14_SCALER_VERSION = "hrv_a14_train_fold_scaler_v1"
+
 EEG18_FEATURE_NAMES = (
     "eeg_n3_frontal_so_log_power",
     "eeg_n3_frontal_delta_log_power",
@@ -60,6 +78,19 @@ EEG18_FEATURE_NAMES = (
 EEG_SCALER_VERSION = "eeg18_identity_train_fold_scaler_v1"
 FUSION_SCALER_VERSION = "caisr20_eeg18_train_fold_scaler_v1"
 EEG_SUBSET_SCALER_VERSION = "caisr20_eeg_subset_train_fold_scaler_v1"
+B1_EEG_FEATURE_NAMES = tuple(EEG18_FEATURE_NAMES[5:9] + EEG18_FEATURE_NAMES[13:18])
+SINGLE_FEATURE_ADDITION_EEG_NAMES = tuple(
+    B1_EEG_FEATURE_NAMES + (EEG18_FEATURE_NAMES[index],)
+    for index in (0, 1, 2, 3, 4, 9, 10, 11, 12)
+)
+REM_COMBINATION_EEG_NAMES = tuple(
+    B1_EEG_FEATURE_NAMES + tuple(EEG18_FEATURE_NAMES[index] for index in indices)
+    for indices in (
+        (9, 10), (9, 11), (9, 12), (10, 11), (10, 12), (11, 12),
+        (9, 10, 11), (9, 10, 12), (9, 11, 12), (10, 11, 12),
+        (9, 10, 11, 12),
+    )
+)
 
 
 def _make_rules() -> dict[str, dict[str, Any]]:
@@ -99,6 +130,11 @@ def rules_for_feature_names(
     """Return the fixed rule set for one approved experiment layout."""
 
     names = list(feature_names)
+    if names == list(HRV_A14_FEATURE_NAMES):
+        rules = _identity_rules(HRV_A14_FEATURE_NAMES)
+        rules[HRV_A14_FEATURE_NAMES[5]]["nonlinear"] = "log1p"
+        rules[HRV_A14_FEATURE_NAMES[6]]["nonlinear"] = "log1p"
+        return rules, HRV_A14_SCALER_VERSION
     if names == list(CAISR20_FEATURE_NAMES):
         return {name: dict(rule) for name, rule in DEFAULT_RULES.items()}, SCALER_VERSION
     if names == list(EEG18_FEATURE_NAMES):
@@ -111,7 +147,11 @@ def rules_for_feature_names(
     eeg_suffix = names[len(caisr_prefix):] if names[:len(caisr_prefix)] == caisr_prefix else []
     if names[:len(caisr_prefix)] == caisr_prefix and eeg_suffix:
         eeg_order = {name: index for index, name in enumerate(EEG18_FEATURE_NAMES)}
-        if all(name in eeg_order for name in eeg_suffix) and eeg_suffix == sorted(eeg_suffix, key=eeg_order.get):
+        if all(name in eeg_order for name in eeg_suffix) and (
+            eeg_suffix == sorted(eeg_suffix, key=eeg_order.get)
+            or tuple(eeg_suffix) in SINGLE_FEATURE_ADDITION_EEG_NAMES
+            or tuple(eeg_suffix) in REM_COMBINATION_EEG_NAMES
+        ):
             rules = {name: dict(rule) for name, rule in DEFAULT_RULES.items()}
             rules.update(_identity_rules(eeg_suffix))
             return rules, EEG_SUBSET_SCALER_VERSION
