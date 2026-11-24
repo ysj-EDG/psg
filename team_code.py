@@ -31,6 +31,8 @@ MODEL_FILENAME = "model.sav"
 MODEL_VERSION = "official_frozen_feature_adapter_v2"
 DEFAULT_CAISR_TSV = ROOT / "feature_extraction/features/caisr/caisr.tsv"
 DEFAULT_EEG_TSV = ROOT / "feature_extraction/features/eeg/eeg_night.tsv"
+DEFAULT_HRV_TSV = ROOT / "feature_extraction/features/ecg/hrv_night_candidate_a14_p1fix_20261122T154346Z/hrv_night.tsv"
+DEFAULT_STAGE_HRV_S2_TSV = ROOT / "feature_extraction/output/stage_hrv_s2_v1/stage_hrv_s2_raw.tsv"
 
 
 def _group_name_from_env() -> str:
@@ -49,6 +51,14 @@ def _feature_paths_from_env(group_name: str) -> dict[str, Path]:
     if "EEG18" in FEATURE_GROUP_COMPONENTS[group_name]:
         paths["EEG18"] = Path(
             os.environ.get("EEG_FEATURE_TSV", str(DEFAULT_EEG_TSV))
+        ).expanduser().resolve()
+    if "HRV14" in FEATURE_GROUP_COMPONENTS[group_name]:
+        paths["HRV14"] = Path(
+            os.environ.get("HRV_FEATURE_TSV", str(DEFAULT_HRV_TSV))
+        ).expanduser().resolve()
+    if "STAGE_HRV_S2" in FEATURE_GROUP_COMPONENTS[group_name]:
+        paths["STAGE_HRV_S2"] = Path(
+            os.environ.get("STAGE_HRV_S2_FEATURE_TSV", str(DEFAULT_STAGE_HRV_S2_TSV))
         ).expanduser().resolve()
     return paths
 

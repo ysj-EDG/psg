@@ -53,6 +53,20 @@ HRV_A14_FEATURE_NAMES = (
     "ecg_hrv_rmssd_w300_equal_mean",
 )
 HRV_A14_SCALER_VERSION = "hrv_a14_train_fold_scaler_v1"
+HRV_A14_FEATURE_VERSION = "hrv_night_candidate_a14_p1"
+CAISR20_HRV14_SCALER_VERSION = "caisr20_hrv14_train_fold_scaler_v1"
+HRV3_INDICES = (4, 10, 11)
+HRV3_FEATURE_NAMES = tuple(HRV_A14_FEATURE_NAMES[index] for index in HRV3_INDICES)
+CAISR20_HRV3_SCALER_VERSION = "caisr20_hrv3_h05_h11_h12_train_fold_scaler_v1"
+
+# Stage-HRV-S2 的正式原始特征。S01 保留原始 HF relative，S02 保留原始
+# HF absolute (ms²)；S02 的唯一非线性变换只在训练折 scaler 中执行一次。
+STAGE_HRV_S2_FEATURE_NAMES = (
+    "S01_N2_HF_relative",
+    "S02_N3_HF_absolute_ms2",
+)
+STAGE_HRV_S2_FEATURE_VERSION = "stage_hrv_s2_v1"
+STAGE_HRV_S2_SCALER_VERSION = "stage_hrv_s2_n2rel_n3hf_log1p_train_fold_v1"
 
 EEG18_FEATURE_NAMES = (
     "eeg_n3_frontal_so_log_power",
@@ -143,6 +157,38 @@ def rules_for_feature_names(
         rules = {name: dict(rule) for name, rule in DEFAULT_RULES.items()}
         rules.update(_identity_rules(EEG18_FEATURE_NAMES))
         return rules, FUSION_SCALER_VERSION
+    if names == list(CAISR20_FEATURE_NAMES + HRV_A14_FEATURE_NAMES):
+        rules = {name: dict(rule) for name, rule in DEFAULT_RULES.items()}
+        hrv_rules = _identity_rules(HRV_A14_FEATURE_NAMES)
+        hrv_rules[HRV_A14_FEATURE_NAMES[5]]["nonlinear"] = "log1p"
+        hrv_rules[HRV_A14_FEATURE_NAMES[6]]["nonlinear"] = "log1p"
+        rules.update(hrv_rules)
+        return rules, CAISR20_HRV14_SCALER_VERSION
+    if names == list(CAISR20_FEATURE_NAMES + HRV3_FEATURE_NAMES):
+        rules = {name: dict(rule) for name, rule in DEFAULT_RULES.items()}
+        rules.update(_identity_rules(HRV3_FEATURE_NAMES))
+        return rules, CAISR20_HRV3_SCALER_VERSION
+
+    # P3 的六个固定布局：CAISR20 + B1/D7 EEG 子集，后接 S01、S02
+    # 的一个或两个维度。保持组件顺序和特征顺序显式，避免把 S02
+    # 误当作已变换的诊断值或重复 log1p。
+    allowed_stage_hrv_layouts = {
+        tuple(CAISR20_FEATURE_NAMES + B1_EEG_FEATURE_NAMES + (STAGE_HRV_S2_FEATURE_NAMES[0],)),
+        tuple(CAISR20_FEATURE_NAMES + B1_EEG_FEATURE_NAMES + (STAGE_HRV_S2_FEATURE_NAMES[1],)),
+        tuple(CAISR20_FEATURE_NAMES + B1_EEG_FEATURE_NAMES + STAGE_HRV_S2_FEATURE_NAMES),
+        tuple(CAISR20_FEATURE_NAMES + B1_EEG_FEATURE_NAMES + EEG18_FEATURE_NAMES[9:12] + (STAGE_HRV_S2_FEATURE_NAMES[0],)),
+        tuple(CAISR20_FEATURE_NAMES + B1_EEG_FEATURE_NAMES + EEG18_FEATURE_NAMES[9:12] + (STAGE_HRV_S2_FEATURE_NAMES[1],)),
+        tuple(CAISR20_FEATURE_NAMES + B1_EEG_FEATURE_NAMES + EEG18_FEATURE_NAMES[9:12] + STAGE_HRV_S2_FEATURE_NAMES),
+    }
+    if tuple(names) in allowed_stage_hrv_layouts:
+        rules = {name: dict(rule) for name, rule in DEFAULT_RULES.items()}
+        suffix = names[len(CAISR20_FEATURE_NAMES):]
+        for name in suffix:
+            if name in EEG18_FEATURE_NAMES or name == STAGE_HRV_S2_FEATURE_NAMES[0]:
+                rules[name] = {"unit_transform": "identity", "nonlinear": "identity", "robust": False}
+            elif name == STAGE_HRV_S2_FEATURE_NAMES[1]:
+                rules[name] = {"unit_transform": "identity", "nonlinear": "log1p", "robust": False}
+        return rules, STAGE_HRV_S2_SCALER_VERSION
     caisr_prefix = list(CAISR20_FEATURE_NAMES)
     eeg_suffix = names[len(caisr_prefix):] if names[:len(caisr_prefix)] == caisr_prefix else []
     if names[:len(caisr_prefix)] == caisr_prefix and eeg_suffix:
@@ -155,7 +201,7 @@ def rules_for_feature_names(
             rules = {name: dict(rule) for name, rule in DEFAULT_RULES.items()}
             rules.update(_identity_rules(eeg_suffix))
             return rules, EEG_SUBSET_SCALER_VERSION
-    raise ValueError("feature names/order must match CAISR20, EEG18, or CAISR20+EEG18 or an approved CAISR20+EEG subset")
+    raise ValueError("feature names/order must match an approved CAISR20, EEG18, HRV14, fusion, or subset layout")
 
 
 def build_feature_scaler(feature_names: Sequence[str]) -> "FeatureScaler":

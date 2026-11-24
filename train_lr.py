@@ -22,6 +22,11 @@ from feature_scaling import (
     CAISR20_FEATURE_NAMES,
     EEG18_FEATURE_NAMES,
     FeatureScaler,
+    HRV_A14_FEATURE_NAMES,
+    HRV_A14_FEATURE_VERSION,
+    HRV3_FEATURE_NAMES,
+    STAGE_HRV_S2_FEATURE_NAMES,
+    STAGE_HRV_S2_FEATURE_VERSION,
     SCALER_VERSION,
     build_feature_scaler,
 )
@@ -39,6 +44,7 @@ OFFICIAL_METRIC_NAMES = (
 
 
 FEATURE_VERSION = "canonical_v2_sleep_event_range"
+HRV_DEFAULT_TSV = ROOT / "feature_extraction/features/ecg/hrv_night_candidate_a14_p1fix_20261122T154346Z/hrv_night.tsv"
 LR_CONFIG = {
     "penalty": "elasticnet",
     "solver": "saga",
@@ -74,6 +80,9 @@ class FeatureGroupDataset:
 
 FEATURE_GROUP_COMPONENTS = {
     "E0_CAISR20": ("CAISR20",),
+    "H0_HRV14": ("HRV14",),
+    "EH_CAISR20_HRV14": ("CAISR20", "HRV14"),
+    "EH3_CAISR20_HRV3": ("CAISR20", "HRV14"),
     "E1_EEG18": ("EEG18",),
     "E2_CAISR20_EEG18": ("CAISR20", "EEG18"),
     "A1_NREM5": ("CAISR20", "EEG18"),
@@ -101,6 +110,22 @@ FEATURE_GROUP_COMPONENTS = {
     "D9": ("CAISR20", "EEG18"),
     "D10": ("CAISR20", "EEG18"),
     "D11": ("CAISR20", "EEG18"),
+    # Stage-HRV-S2 P3 固定实验组。S2 作为独立组件追加在 EEG 子集之后。
+    "B1_BASE": ("CAISR20", "EEG18"),
+    "B1_N2": ("CAISR20", "EEG18", "STAGE_HRV_S2"),
+    "B1_N3": ("CAISR20", "EEG18", "STAGE_HRV_S2"),
+    "B1_S2": ("CAISR20", "EEG18", "STAGE_HRV_S2"),
+    "D7_BASE": ("CAISR20", "EEG18"),
+    "D7_S2": ("CAISR20", "EEG18", "STAGE_HRV_S2"),
+}
+FEATURE_GROUP_HRV_FEATURES = {
+    "EH3_CAISR20_HRV3": tuple(HRV3_FEATURE_NAMES),
+}
+FEATURE_GROUP_STAGE_HRV_FEATURES = {
+    "B1_N2": (STAGE_HRV_S2_FEATURE_NAMES[0],),
+    "B1_N3": (STAGE_HRV_S2_FEATURE_NAMES[1],),
+    "B1_S2": tuple(STAGE_HRV_S2_FEATURE_NAMES),
+    "D7_S2": tuple(STAGE_HRV_S2_FEATURE_NAMES),
 }
 FEATURE_GROUP_EEG_FEATURES = {
     "E0_CAISR20": (),
@@ -133,10 +158,18 @@ FEATURE_GROUP_EEG_FEATURES = {
     "D9": tuple(EEG18_FEATURE_NAMES[5:9] + EEG18_FEATURE_NAMES[13:18] + (EEG18_FEATURE_NAMES[9], EEG18_FEATURE_NAMES[11], EEG18_FEATURE_NAMES[12])),
     "D10": tuple(EEG18_FEATURE_NAMES[5:9] + EEG18_FEATURE_NAMES[13:18] + EEG18_FEATURE_NAMES[10:13]),
     "D11": tuple(EEG18_FEATURE_NAMES[5:9] + EEG18_FEATURE_NAMES[13:18] + EEG18_FEATURE_NAMES[9:13]),
+    "B1_BASE": tuple(EEG18_FEATURE_NAMES[5:9] + EEG18_FEATURE_NAMES[13:18]),
+    "B1_N2": tuple(EEG18_FEATURE_NAMES[5:9] + EEG18_FEATURE_NAMES[13:18]),
+    "B1_N3": tuple(EEG18_FEATURE_NAMES[5:9] + EEG18_FEATURE_NAMES[13:18]),
+    "B1_S2": tuple(EEG18_FEATURE_NAMES[5:9] + EEG18_FEATURE_NAMES[13:18]),
+    "D7_BASE": tuple(EEG18_FEATURE_NAMES[5:9] + EEG18_FEATURE_NAMES[13:18] + EEG18_FEATURE_NAMES[9:12]),
+    "D7_S2": tuple(EEG18_FEATURE_NAMES[5:9] + EEG18_FEATURE_NAMES[13:18] + EEG18_FEATURE_NAMES[9:12]),
 }
 FEATURE_COMPONENT_SCHEMA = {
     "CAISR20": (list(CAISR20_FEATURE_NAMES), FEATURE_VERSION),
     "EEG18": (list(EEG18_FEATURE_NAMES), "eeg_night_candidate_v2"),
+    "HRV14": (list(HRV_A14_FEATURE_NAMES), HRV_A14_FEATURE_VERSION),
+    "STAGE_HRV_S2": (list(STAGE_HRV_S2_FEATURE_NAMES), STAGE_HRV_S2_FEATURE_VERSION),
 }
 
 
@@ -144,6 +177,10 @@ def _read_feature_component(
     path: str | Path, component: str,
 ) -> tuple[list[str], dict[str, tuple[str, np.ndarray, np.ndarray]], str]:
     expected_names, expected_version = FEATURE_COMPONENT_SCHEMA[component]
+    if component == "HRV14":
+        return _read_hrv_component(path, expected_names, expected_version)
+    if component == "STAGE_HRV_S2":
+        return _read_stage_hrv_s2_component(path, expected_names, expected_version)
     frame = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
     required = {"record_id", "site", "feature_version", "feature_names", "values", "valid_mask"}
     missing = sorted(required - set(frame.columns))
@@ -172,6 +209,143 @@ def _read_feature_component(
     return expected_names, records, expected_version
 
 
+def _read_hrv_component(
+    path: str | Path, expected_names: list[str], expected_version: str,
+) -> tuple[list[str], dict[str, tuple[str, np.ndarray, np.ndarray]], str]:
+    """Read frozen wide HRV values and sidecars without filling missing values."""
+
+    value_path = Path(path).resolve()
+    mask_path = value_path.with_name("hrv_night_valid_mask.tsv")
+    reason_path = value_path.with_name("hrv_night_invalid_reason.tsv")
+    for candidate in (value_path, mask_path, reason_path):
+        if not candidate.is_file():
+            raise FileNotFoundError(f"HRV14 adapter input is missing: {candidate}")
+    value_frame = pd.read_csv(value_path, sep="\t", dtype=str, keep_default_na=False)
+    mask_frame = pd.read_csv(mask_path, sep="\t", dtype=str, keep_default_na=False)
+    reason_frame = pd.read_csv(reason_path, sep="\t", dtype=str, keep_default_na=False)
+    value_columns = ["record_id", "site", "feature_version", *expected_names]
+    sidecar_columns = ["record_id", "site", *expected_names]
+    for frame, required, label in (
+        (value_frame, value_columns, "values"),
+        (mask_frame, sidecar_columns, "valid_mask"),
+        (reason_frame, sidecar_columns, "invalid_reason"),
+    ):
+        missing = sorted(set(required) - set(frame.columns))
+        if missing:
+            raise ValueError(f"HRV14 {label} TSV missing columns: {missing}")
+        if frame["record_id"].duplicated().any():
+            raise ValueError(f"HRV14 {label} TSV has duplicate record_id")
+    value_ids = value_frame["record_id"].astype(str).tolist()
+    if mask_frame["record_id"].astype(str).tolist() != value_ids:
+        raise ValueError("HRV14 values and valid_mask record_id order mismatch")
+    if reason_frame["record_id"].astype(str).tolist() != value_ids:
+        raise ValueError("HRV14 values and invalid_reason record_id order mismatch")
+    if not value_frame["site"].astype(str).equals(mask_frame["site"].astype(str)) or not value_frame["site"].astype(str).equals(reason_frame["site"].astype(str)):
+        raise ValueError("HRV14 sidecar site order mismatch")
+
+    records: dict[str, tuple[str, np.ndarray, np.ndarray]] = {}
+    for value_row, mask_row in zip(value_frame.itertuples(index=False), mask_frame.itertuples(index=False)):
+        values_dict = value_row._asdict()
+        masks_dict = mask_row._asdict()
+        if values_dict["feature_version"] != expected_version:
+            raise ValueError(
+                f"HRV14 unexpected feature version for {values_dict['record_id']}: {values_dict['feature_version']}"
+            )
+        parsed_values = []
+        parsed_mask = []
+        for name in expected_names:
+            raw_value = str(values_dict[name]).strip()
+            if raw_value == "" or raw_value.lower() in {"nan", "na", "none"}:
+                value = np.nan
+            else:
+                value = float(raw_value)
+            if not np.isfinite(value) and not np.isnan(value):
+                raise ValueError(f"HRV14 contains Inf at {values_dict['record_id']} / {name}")
+            raw_mask = str(masks_dict[name]).strip().lower()
+            if raw_mask not in {"0", "1", "true", "false"}:
+                raise ValueError(f"HRV14 valid_mask is not binary at {values_dict['record_id']} / {name}")
+            valid = raw_mask in {"1", "true"}
+            if valid and not np.isfinite(value):
+                raise ValueError(f"HRV14 valid value is non-finite at {values_dict['record_id']} / {name}")
+            if not valid and np.isfinite(value):
+                raise ValueError(f"HRV14 invalid value must be NaN at {values_dict['record_id']} / {name}")
+            parsed_values.append(value)
+            parsed_mask.append(valid)
+        record_id = str(values_dict["record_id"])
+        records[record_id] = (
+            str(values_dict["site"]),
+            np.asarray(parsed_values, dtype=float),
+            np.asarray(parsed_mask, dtype=bool),
+        )
+    return expected_names, records, expected_version
+
+
+def _read_stage_hrv_s2_component(
+    path: str | Path, expected_names: list[str], expected_version: str,
+) -> tuple[list[str], dict[str, tuple[str, np.ndarray, np.ndarray]], str]:
+    """读取Stage-HRV-S2正式raw/validity TSV，并保持NaN/valid_mask语义。"""
+
+    value_path = Path(path).resolve()
+    validity_path = value_path.with_name("stage_hrv_s2_validity.tsv")
+    if not value_path.is_file() or not validity_path.is_file():
+        raise FileNotFoundError(f"Stage-HRV-S2 input is missing: {value_path} or {validity_path}")
+    value_frame = pd.read_csv(value_path, sep="\t", dtype=str, keep_default_na=False)
+    validity_frame = pd.read_csv(validity_path, sep="\t", dtype=str, keep_default_na=False)
+    raw_columns = {
+        "S01_N2_HF_relative": "s01_n2_hf_relative",
+        "S02_N3_HF_absolute_ms2": "s02_n3_hf_absolute_ms2",
+    }
+    required = {"record_id", "site", "feature_version", *raw_columns.values()}
+    missing = sorted(required - set(value_frame.columns))
+    if missing:
+        raise ValueError(f"Stage-HRV-S2 values TSV missing columns: {missing}")
+    required_validity = {"record_id", "site", "feature_name", "valid", "feature_version"}
+    missing = sorted(required_validity - set(validity_frame.columns))
+    if missing:
+        raise ValueError(f"Stage-HRV-S2 validity TSV missing columns: {missing}")
+    if value_frame["record_id"].duplicated().any():
+        raise ValueError("Stage-HRV-S2 values TSV has duplicate record_id")
+    expected_ids = value_frame["record_id"].astype(str).tolist()
+    validity_by_id: dict[str, dict[str, bool]] = {}
+    for row in validity_frame.itertuples(index=False):
+        item = row._asdict()
+        record_id = str(item["record_id"])
+        if item["feature_version"] != expected_version:
+            raise ValueError(f"Stage-HRV-S2 unexpected validity version for {record_id}")
+        if str(item["feature_name"]) not in expected_names:
+            raise ValueError(f"Stage-HRV-S2 unexpected feature name for {record_id}: {item['feature_name']}")
+        if record_id in validity_by_id and str(item["feature_name"]) in validity_by_id[record_id]:
+            raise ValueError(f"Stage-HRV-S2 duplicate validity row for {record_id}/{item['feature_name']}")
+        raw_valid = str(item["valid"]).strip().lower()
+        if raw_valid not in {"0", "1", "true", "false"}:
+            raise ValueError(f"Stage-HRV-S2 validity is not binary for {record_id}")
+        validity_by_id.setdefault(record_id, {})[str(item["feature_name"])] = raw_valid in {"1", "true"}
+    records: dict[str, tuple[str, np.ndarray, np.ndarray]] = {}
+    for row in value_frame.itertuples(index=False):
+        item = row._asdict()
+        record_id = str(item["record_id"])
+        if item["feature_version"] != expected_version:
+            raise ValueError(f"Stage-HRV-S2 unexpected value version for {record_id}")
+        if record_id not in validity_by_id or set(validity_by_id[record_id]) != set(expected_names):
+            raise ValueError(f"Stage-HRV-S2 validity rows incomplete for {record_id}")
+        values: list[float] = []
+        masks: list[bool] = []
+        for name in expected_names:
+            raw_value = str(item[raw_columns[name]]).strip()
+            value = np.nan if raw_value == "" or raw_value.lower() in {"na", "nan", "none"} else float(raw_value)
+            valid = validity_by_id[record_id][name]
+            if valid and not np.isfinite(value):
+                raise ValueError(f"Stage-HRV-S2 valid value is non-finite for {record_id}/{name}")
+            if not valid and np.isfinite(value):
+                raise ValueError(f"Stage-HRV-S2 invalid value is finite for {record_id}/{name}")
+            values.append(value)
+            masks.append(valid)
+        records[record_id] = (str(item["site"]), np.asarray(values, dtype=float), np.asarray(masks, dtype=bool))
+    if set(records) != set(expected_ids):
+        raise ValueError("Stage-HRV-S2 values changed record identity set")
+    return expected_names, records, expected_version
+
+
 def _feature_group_index(
     feature_paths: Mapping[str, str | Path], group_name: str,
 ) -> tuple[dict[str, tuple[str, np.ndarray, np.ndarray]], list[str], dict[str, str]]:
@@ -188,9 +362,13 @@ def _feature_group_index(
         selected_names = list(component_names)
         if component == "EEG18" and group_name in FEATURE_GROUP_EEG_FEATURES:
             selected_names = list(FEATURE_GROUP_EEG_FEATURES[group_name])
+        if component == "HRV14" and group_name in FEATURE_GROUP_HRV_FEATURES:
+            selected_names = list(FEATURE_GROUP_HRV_FEATURES[group_name])
+        if component == "STAGE_HRV_S2" and group_name in FEATURE_GROUP_STAGE_HRV_FEATURES:
+            selected_names = list(FEATURE_GROUP_STAGE_HRV_FEATURES[group_name])
         missing_selected = sorted(set(selected_names) - set(component_names))
         if missing_selected:
-            raise ValueError(f"{group_name} requests missing EEG features: {missing_selected}")
+            raise ValueError(f"{group_name} requests missing component features: {missing_selected}")
         selected_indices = [component_names.index(name) for name in selected_names]
         component_data[component] = (component_names, data, selected_indices)
         names.extend(selected_names)
@@ -752,6 +930,8 @@ def _run_feature_group_loso(
         env["PSG_FEATURE_GROUP"] = group_name
         env["CAISR_FEATURE_TSV"] = dataset.feature_paths.get("CAISR20", "")
         env["EEG_FEATURE_TSV"] = dataset.feature_paths.get("EEG18", "")
+        env["HRV_FEATURE_TSV"] = dataset.feature_paths.get("HRV14", "")
+        env["STAGE_HRV_S2_FEATURE_TSV"] = dataset.feature_paths.get("STAGE_HRV_S2", "")
         _run_official("train_model.py", ["-d", str(train_data), "-m", str(model_dir)], env)
         prediction_dir = fold_dir / "predictions"
         _run_official(
@@ -903,6 +1083,7 @@ def run_feature_group_experiments(
     old_e0_output: str | Path = "output/caisr",
     groups: tuple[str, ...] = ("E0_CAISR20", "E1_EEG18", "E2_CAISR20_EEG18"),
     reference_output: str | Path = "output/caisr_eeg",
+    hrv_feature_path: str | Path = HRV_DEFAULT_TSV,
 ) -> dict[str, Any]:
     """Run the fixed three-group official LOSO experiment without touching old output."""
 
@@ -910,7 +1091,11 @@ def run_feature_group_experiments(
     if output_root.exists() and any(output_root.iterdir()):
         raise FileExistsError(f"refusing to overwrite non-empty output: {output_root}")
     output_root.mkdir(parents=True, exist_ok=True)
-    paths = {"CAISR20": Path(caisr_feature_path).resolve(), "EEG18": Path(eeg_feature_path).resolve()}
+    paths = {
+        "CAISR20": Path(caisr_feature_path).resolve(),
+        "EEG18": Path(eeg_feature_path).resolve(),
+        "HRV14": Path(hrv_feature_path).resolve(),
+    }
     datasets = {
         group: load_feature_group_dataset(paths, demographics_path, group_name=group)
         for group in groups
@@ -977,6 +1162,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--output", default="output/caisr")
     parser.add_argument("--eeg-features", default="feature_extraction/features/eeg/eeg_night.tsv")
+    parser.add_argument("--hrv-features", default=str(HRV_DEFAULT_TSV))
     parser.add_argument("--old-e0-output", default="output/caisr")
     parser.add_argument("--reference-output", default="output/caisr_eeg")
     parser.add_argument("--experiment-groups", nargs="+", choices=tuple(FEATURE_GROUP_COMPONENTS))
@@ -985,6 +1171,7 @@ def main(argv: list[str] | None = None) -> None:
         result = run_feature_group_experiments(
             args.features, args.eeg_features, args.demographics, args.output, args.old_e0_output,
             tuple(args.experiment_groups), args.reference_output,
+            hrv_feature_path=args.hrv_features,
         )
     else:
         result = run_loso_experiment(args.features, args.demographics, args.output)
