@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 from scipy.signal import periodogram
@@ -71,6 +71,69 @@ FEATURE_NAMES = (
     "eeg_n3_frontal_swa_left_right_log_asymmetry",
     "eeg_n2_central_sigma_left_right_log_asymmetry",
 )
+EEG12_FEATURE_NAMES = (
+    FEATURE_NAMES[5],
+    FEATURE_NAMES[6],
+    FEATURE_NAMES[7],
+    FEATURE_NAMES[8],
+    FEATURE_NAMES[13],
+    FEATURE_NAMES[14],
+    FEATURE_NAMES[15],
+    FEATURE_NAMES[16],
+    FEATURE_NAMES[17],
+    FEATURE_NAMES[9],
+    FEATURE_NAMES[10],
+    FEATURE_NAMES[11],
+)
+EEG12_FEATURE_INDICES = (5, 6, 7, 8, 13, 14, 15, 16, 17, 9, 10, 11)
+_FEATURE_INDEX_BY_NAME = {name: index for index, name in enumerate(FEATURE_NAMES)}
+
+
+def resolve_selected_feature_names(config: Mapping[str, Any] | None = None) -> tuple[str, ...]:
+    """解析名称驱动的 EEG 特征选择；不传配置时保持历史 18 维语义。"""
+
+    options = config or {}
+    selected = options.get("selected_feature_names")
+    if selected is None:
+        return FEATURE_NAMES
+    if isinstance(selected, (str, bytes)):
+        raise ValueError("selected_feature_names must be a non-empty sequence of names")
+    names = tuple(str(name) for name in selected)
+    if not names:
+        raise ValueError("selected_feature_names must not be empty")
+    if len(set(names)) != len(names):
+        raise ValueError("selected_feature_names must not contain duplicates")
+    unknown = [name for name in names if name not in _FEATURE_INDEX_BY_NAME]
+    if unknown:
+        raise ValueError(f"unknown EEG feature name(s): {', '.join(unknown)}")
+    return names
+
+
+def _required_band_names(selected_indices: Sequence[int]) -> tuple[str, ...]:
+    """返回选中特征真正需要积分的频带，保持 PSD 计算共享。"""
+
+    by_index = {
+        0: ("SO",),
+        1: ("DELTA_1_4",),
+        2: ("SWA",),
+        3: ("SO", "DELTA_1_4"),
+        4: ("SWA", "FAST_TOTAL"),
+        5: ("SIGMA", "TOTAL"),
+        6: ("SLOW_SIGMA", "TOTAL"),
+        7: ("FAST_SIGMA", "TOTAL"),
+        8: ("FAST_SIGMA", "TOTAL"),
+        9: ("REM_DELTA", "REM_THETA", "REM_ALPHA", "REM_SIGMA", "REM_BETA"),
+        10: ("REM_DELTA", "REM_THETA", "REM_ALPHA", "REM_SIGMA", "REM_BETA"),
+        11: ("REM_DELTA", "REM_THETA", "REM_ALPHA", "REM_SIGMA", "REM_BETA"),
+        12: ("REM_THETA", "REM_ALPHA"),
+        13: ("SWA",),
+        14: ("FAST_SIGMA",),
+        15: ("REM_DELTA", "REM_THETA", "REM_ALPHA", "REM_SIGMA", "REM_BETA"),
+        16: ("SWA",),
+        17: ("SIGMA",),
+    }
+    required = {band for index in selected_indices for band in by_index[index]}
+    return tuple(band for band in ALL_BANDS if band in required)
 CORE_FEATURE_COUNT = 14
 EXPERIMENTAL_FEATURE_COUNT = 4
 
@@ -222,16 +285,22 @@ def _safe_relative(numerator: float, denominator: float) -> float:
     return float(numerator / denominator)
 
 
-def _empty_block(reason: str, *, config: Mapping[str, Any] | None = None) -> BranchResult:
-    values = np.full(len(FEATURE_NAMES), np.nan, dtype=np.float32)
-    valid = np.zeros(len(FEATURE_NAMES), dtype=bool)
-    reasons = np.full(len(FEATURE_NAMES), reason, dtype="U64")
+def _empty_block(
+    reason: str,
+    *,
+    config: Mapping[str, Any] | None = None,
+    feature_names: Sequence[str] | None = None,
+) -> BranchResult:
+    names = tuple(feature_names or (config or {}).get("selected_feature_names", FEATURE_NAMES))
+    values = np.full(len(names), np.nan, dtype=np.float32)
+    valid = np.zeros(len(names), dtype=bool)
+    reasons = np.full(len(names), reason, dtype=f"<U{max(1, len(reason))}")
     block = FeatureBlock(
         branch_name=BRANCH_NAME,
         feature_set_name="eeg_night",
         time_scale=TimeScale.NIGHT,
         values=values,
-        feature_names=FEATURE_NAMES,
+        feature_names=names,
         valid_mask=valid,
         invalid_reason=reasons,
         config=config or {},
@@ -240,7 +309,7 @@ def _empty_block(reason: str, *, config: Mapping[str, Any] | None = None) -> Bra
     return BranchResult(
         branch_name=BRANCH_NAME,
         blocks=(block,),
-        metadata={"feature_version": FEATURE_VERSION, "error": reason},
+        metadata={"feature_version": FEATURE_VERSION, "error": reason, "feature_names": names},
     )
 
 
@@ -527,14 +596,23 @@ def quality_gate(context: Any, config: Mapping[str, Any] | None = None) -> Mappi
 
 
 def extract(context: Any, config: Mapping[str, Any] | None = None) -> BranchResult:
-    """从一个 SampleContext 提取 18 维候选整夜 EEG 特征。"""
+    """提取名称选择的整夜 EEG 特征；无配置时保持历史18维兼容。"""
 
     options = dict(config or {})
+    selected_feature_names = resolve_selected_feature_names(options)
+    selected_indices = tuple(_FEATURE_INDEX_BY_NAME[name] for name in selected_feature_names)
+    required_band_names = _required_band_names(selected_indices)
     batch_epochs = int(options.get("batch_epochs", 8))
     if batch_epochs <= 0:
         raise ValueError("batch_epochs must be positive")
     feature_config = _feature_config()
     feature_config["batch_epochs"] = batch_epochs
+    feature_config["selected_feature_names"] = selected_feature_names
+    feature_config["selected_feature_indices"] = selected_indices
+    feature_config["skipped_feature_names"] = tuple(
+        name for index, name in enumerate(FEATURE_NAMES) if index not in selected_indices
+    )
+    feature_config["selected_band_names"] = required_band_names
 
     try:
         signal_dataset = context.dataset("signals/eeg")
@@ -602,6 +680,8 @@ def extract(context: Any, config: Mapping[str, Any] | None = None) -> BranchResu
     gradient_window_counts: dict[tuple[int, str, str], int] = {}
     qc_true_counts = {name: 0 for name in ("invalid", "flat", "extreme")}
     finite_window_count = 0
+    psd_batch_count = 0
+    psd_window_count = 0
 
     for batch_start, signal_batch in context.iter_signal_epochs("eeg", batch_epochs=batch_epochs):
         signal_batch = np.asarray(signal_batch, dtype=np.float64)
@@ -619,6 +699,8 @@ def extract(context: Any, config: Mapping[str, Any] | None = None) -> BranchResu
         windows = signal_batch.reshape(batch_size, len(CANONICAL_CHANNELS), WINDOWS_PER_EPOCH, WINDOW_SAMPLES)
         finite_windows = np.isfinite(windows).all(axis=-1)
         safe_windows = np.where(np.isfinite(windows), windows, 0.0)
+        psd_batch_count += 1
+        psd_window_count += int(batch_size * len(CANONICAL_CHANNELS) * WINDOWS_PER_EPOCH)
         frequencies, psd_batch = periodogram(
             safe_windows,
             fs=EEG_FS,
@@ -630,8 +712,10 @@ def extract(context: Any, config: Mapping[str, Any] | None = None) -> BranchResu
             scaling="density",
         )
         band_power_batch = {
-            band_name: _integrate_band_power_batch(frequencies, psd_batch, low_hz, high_hz)
-            for band_name, (low_hz, high_hz) in ALL_BANDS.items()
+            band_name: _integrate_band_power_batch(
+                frequencies, psd_batch, *ALL_BANDS[band_name]
+            )
+            for band_name in required_band_names
         }
         for stage_value, count in zip(*np.unique(stages, return_counts=True)):
             stage_counts[int(stage_value)] = stage_counts.get(int(stage_value), 0) + int(count)
@@ -724,23 +808,33 @@ def extract(context: Any, config: Mapping[str, Any] | None = None) -> BranchResu
                                 gradient_counts[key] = gradient_counts.get(key, 0) + full_count
 
 
-    values = np.full(len(FEATURE_NAMES), np.nan, dtype=np.float32)
-    valid = np.zeros(len(FEATURE_NAMES), dtype=bool)
-    reasons = np.full(len(FEATURE_NAMES), "coverage_insufficient", dtype="U64")
+    full_values = np.full(len(FEATURE_NAMES), np.nan, dtype=np.float32)
+    full_valid = np.zeros(len(FEATURE_NAMES), dtype=bool)
+    full_reasons = np.full(len(FEATURE_NAMES), "coverage_insufficient", dtype="<U24")
+    values = full_values
+    valid = full_valid
+    reasons = full_reasons
     region_count_view = {
         key: int(value) for key, value in region_window_counts.items()
     }
     config = feature_config
+
+    def assign_selected(*args: Any, **kwargs: Any) -> None:
+        # 保留完整索引用于公式复用，但只执行调用方显式请求的特征。
+        index = int(args[3])
+        if index in selected_indices:
+            _assign_feature(*args, **kwargs)
+
     # Values are computed from stage/region linear-power means, then transformed.
-    _assign_feature(values, valid, reasons, 0, 1, ("frontal",), lambda: _safe_log(_region_mean(region_sums, region_counts, 1, "frontal", "SO")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
-    _assign_feature(values, valid, reasons, 1, 1, ("frontal",), lambda: _safe_log(_region_mean(region_sums, region_counts, 1, "frontal", "DELTA_1_4")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
-    _assign_feature(values, valid, reasons, 2, 2, ("frontal",), lambda: _safe_log(_region_mean(region_sums, region_counts, 2, "frontal", "SWA")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
-    _assign_feature(values, valid, reasons, 3, 1, ("frontal",), lambda: _safe_log_ratio(_region_mean(region_sums, region_counts, 1, "frontal", "SO"), _region_mean(region_sums, region_counts, 1, "frontal", "DELTA_1_4")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
-    _assign_feature(values, valid, reasons, 4, 1, ("frontal",), lambda: _safe_log_ratio(_region_mean(region_sums, region_counts, 1, "frontal", "SWA"), _region_mean(region_sums, region_counts, 1, "frontal", "FAST_TOTAL")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
-    _assign_feature(values, valid, reasons, 5, 2, ("central",), lambda: _safe_relative(_region_mean(region_sums, region_counts, 2, "central", "SIGMA"), _region_mean(region_sums, region_counts, 2, "central", "TOTAL")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
-    _assign_feature(values, valid, reasons, 6, 2, ("frontal",), lambda: _safe_relative(_region_mean(region_sums, region_counts, 2, "frontal", "SLOW_SIGMA"), _region_mean(region_sums, region_counts, 2, "frontal", "TOTAL")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
-    _assign_feature(values, valid, reasons, 7, 2, ("central",), lambda: _safe_relative(_region_mean(region_sums, region_counts, 2, "central", "FAST_SIGMA"), _region_mean(region_sums, region_counts, 2, "central", "TOTAL")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
-    _assign_feature(values, valid, reasons, 8, 2, ("occipital",), lambda: _safe_relative(_region_mean(region_sums, region_counts, 2, "occipital", "FAST_SIGMA"), _region_mean(region_sums, region_counts, 2, "occipital", "TOTAL")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
+    assign_selected(values, valid, reasons, 0, 1, ("frontal",), lambda: _safe_log(_region_mean(region_sums, region_counts, 1, "frontal", "SO")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
+    assign_selected(values, valid, reasons, 1, 1, ("frontal",), lambda: _safe_log(_region_mean(region_sums, region_counts, 1, "frontal", "DELTA_1_4")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
+    assign_selected(values, valid, reasons, 2, 2, ("frontal",), lambda: _safe_log(_region_mean(region_sums, region_counts, 2, "frontal", "SWA")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
+    assign_selected(values, valid, reasons, 3, 1, ("frontal",), lambda: _safe_log_ratio(_region_mean(region_sums, region_counts, 1, "frontal", "SO"), _region_mean(region_sums, region_counts, 1, "frontal", "DELTA_1_4")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
+    assign_selected(values, valid, reasons, 4, 1, ("frontal",), lambda: _safe_log_ratio(_region_mean(region_sums, region_counts, 1, "frontal", "SWA"), _region_mean(region_sums, region_counts, 1, "frontal", "FAST_TOTAL")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
+    assign_selected(values, valid, reasons, 5, 2, ("central",), lambda: _safe_relative(_region_mean(region_sums, region_counts, 2, "central", "SIGMA"), _region_mean(region_sums, region_counts, 2, "central", "TOTAL")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
+    assign_selected(values, valid, reasons, 6, 2, ("frontal",), lambda: _safe_relative(_region_mean(region_sums, region_counts, 2, "frontal", "SLOW_SIGMA"), _region_mean(region_sums, region_counts, 2, "frontal", "TOTAL")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
+    assign_selected(values, valid, reasons, 7, 2, ("central",), lambda: _safe_relative(_region_mean(region_sums, region_counts, 2, "central", "FAST_SIGMA"), _region_mean(region_sums, region_counts, 2, "central", "TOTAL")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
+    assign_selected(values, valid, reasons, 8, 2, ("occipital",), lambda: _safe_relative(_region_mean(region_sums, region_counts, 2, "occipital", "FAST_SIGMA"), _region_mean(region_sums, region_counts, 2, "occipital", "TOTAL")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
 
     def rem_slowing(region: str) -> float:
         slow = _region_mean(region_sums, region_counts, 4, region, "REM_DELTA") + _region_mean(region_sums, region_counts, 4, region, "REM_THETA")
@@ -751,15 +845,15 @@ def extract(context: Any, config: Mapping[str, Any] | None = None) -> BranchResu
         )
         return _safe_log_ratio(slow, fast)
 
-    _assign_feature(values, valid, reasons, 9, 4, ("occipital",), lambda: rem_slowing("occipital"), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
-    _assign_feature(values, valid, reasons, 10, 4, ("central",), lambda: rem_slowing("central"), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
-    _assign_feature(values, valid, reasons, 11, 4, ("frontal",), lambda: rem_slowing("frontal"), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
-    _assign_feature(values, valid, reasons, 12, 4, ("occipital",), lambda: _safe_log_ratio(_region_mean(region_sums, region_counts, 4, "occipital", "REM_THETA"), _region_mean(region_sums, region_counts, 4, "occipital", "REM_ALPHA")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
-    _assign_feature(values, valid, reasons, 13, 1, ("frontal", "occipital"), lambda: _same_side_gradient(gradient_sums, gradient_counts, 1, "SWA"), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view, common_regions=(("frontal", "occipital"),), common_counts=gradient_window_counts, complete_regions=("frontal", "occipital"))
-    _assign_feature(values, valid, reasons, 14, 2, ("frontal", "occipital"), lambda: _same_side_gradient(gradient_sums, gradient_counts, 2, "FAST_SIGMA"), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view, common_regions=(("frontal", "occipital"),), common_counts=gradient_window_counts, complete_regions=("frontal", "occipital"))
-    _assign_feature(values, valid, reasons, 15, 4, ("occipital", "frontal"), lambda: _common_rem_slowing(common_region_sums, common_region_counts, 4, "occipital") - _common_rem_slowing(common_region_sums, common_region_counts, 4, "frontal"), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view, common_regions=(("frontal", "occipital"),), common_counts=common_window_counts)
-    _assign_feature(values, valid, reasons, 16, 1, ("frontal",), lambda: _safe_log_ratio(_pair_mean(pair_sums, pair_counts, 1, "frontal", "left", "SWA"), _pair_mean(pair_sums, pair_counts, 1, "frontal", "right", "SWA")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view, pair_regions=("frontal",), pair_counts=pair_counts)
-    _assign_feature(values, valid, reasons, 17, 2, ("central",), lambda: _safe_log_ratio(_pair_mean(pair_sums, pair_counts, 2, "central", "left", "SIGMA"), _pair_mean(pair_sums, pair_counts, 2, "central", "right", "SIGMA")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view, pair_regions=("central",), pair_counts=pair_counts)
+    assign_selected(values, valid, reasons, 9, 4, ("occipital",), lambda: rem_slowing("occipital"), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
+    assign_selected(values, valid, reasons, 10, 4, ("central",), lambda: rem_slowing("central"), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
+    assign_selected(values, valid, reasons, 11, 4, ("frontal",), lambda: rem_slowing("frontal"), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
+    assign_selected(values, valid, reasons, 12, 4, ("occipital",), lambda: _safe_log_ratio(_region_mean(region_sums, region_counts, 4, "occipital", "REM_THETA"), _region_mean(region_sums, region_counts, 4, "occipital", "REM_ALPHA")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view)
+    assign_selected(values, valid, reasons, 13, 1, ("frontal", "occipital"), lambda: _same_side_gradient(gradient_sums, gradient_counts, 1, "SWA"), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view, common_regions=(("frontal", "occipital"),), common_counts=gradient_window_counts, complete_regions=("frontal", "occipital"))
+    assign_selected(values, valid, reasons, 14, 2, ("frontal", "occipital"), lambda: _same_side_gradient(gradient_sums, gradient_counts, 2, "FAST_SIGMA"), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view, common_regions=(("frontal", "occipital"),), common_counts=gradient_window_counts, complete_regions=("frontal", "occipital"))
+    assign_selected(values, valid, reasons, 15, 4, ("occipital", "frontal"), lambda: _common_rem_slowing(common_region_sums, common_region_counts, 4, "occipital") - _common_rem_slowing(common_region_sums, common_region_counts, 4, "frontal"), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view, common_regions=(("frontal", "occipital"),), common_counts=common_window_counts)
+    assign_selected(values, valid, reasons, 16, 1, ("frontal",), lambda: _safe_log_ratio(_pair_mean(pair_sums, pair_counts, 1, "frontal", "left", "SWA"), _pair_mean(pair_sums, pair_counts, 1, "frontal", "right", "SWA")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view, pair_regions=("frontal",), pair_counts=pair_counts)
+    assign_selected(values, valid, reasons, 17, 2, ("central",), lambda: _safe_log_ratio(_pair_mean(pair_sums, pair_counts, 2, "central", "left", "SIGMA"), _pair_mean(pair_sums, pair_counts, 2, "central", "right", "SIGMA")), stage_counts=stage_counts, region_indices=region_indices, present=present, units_ok=units_ok, region_counts=region_count_view, pair_regions=("central",), pair_counts=pair_counts)
 
     feature_stage = {
         0: 1, 1: 1, 2: 2, 3: 1, 4: 1, 5: 2, 6: 2, 7: 2, 8: 2,
@@ -770,8 +864,12 @@ def extract(context: Any, config: Mapping[str, Any] | None = None) -> BranchResu
         5: "central", 6: "frontal", 7: "central", 8: "occipital",
         9: "occipital", 10: "central", 11: "frontal", 12: "occipital",
     }
+    values = full_values[list(selected_indices)]
+    valid = full_valid[list(selected_indices)]
+    reasons = full_reasons[list(selected_indices)]
     feature_support_seconds = {}
-    for index, stage in feature_stage.items():
+    for index in selected_indices:
+        stage = feature_stage[index]
         if index in (13, 14):
             count = gradient_window_counts.get((stage, "frontal", "occipital"), 0)
         elif index == 15:
@@ -785,7 +883,15 @@ def extract(context: Any, config: Mapping[str, Any] | None = None) -> BranchResu
         feature_support_seconds[FEATURE_NAMES[index]] = float(count * WINDOW_SECONDS)
     metadata = {
         "feature_version": FEATURE_VERSION,
-        "feature_names": FEATURE_NAMES,
+        "feature_names": selected_feature_names,
+        "selected_feature_names": selected_feature_names,
+        "selected_feature_indices": selected_indices,
+        "skipped_feature_names": tuple(name for index, name in enumerate(FEATURE_NAMES) if index not in selected_indices),
+        "selected_band_names": required_band_names,
+        "psd_batch_count": int(psd_batch_count),
+        "psd_window_count": int(psd_window_count),
+        "psd_band_integrals_per_window": int(len(required_band_names)),
+        "psd_band_integrals_evaluated": int(psd_window_count * len(required_band_names)),
         "min_valid_stage_seconds": dict(MIN_VALID_STAGE_SEC),
         "stage_counts": {str(key): int(value) for key, value in stage_counts.items()},
         "stage_raw_seconds": {STAGE_NAMES_BY_CODE.get(key, str(key)): float(value * EPOCH_SECONDS) for key, value in stage_counts.items()},
@@ -819,7 +925,7 @@ def extract(context: Any, config: Mapping[str, Any] | None = None) -> BranchResu
         feature_set_name="eeg_night",
         time_scale=TimeScale.NIGHT,
         values=values,
-        feature_names=FEATURE_NAMES,
+        feature_names=selected_feature_names,
         valid_mask=valid,
         invalid_reason=reasons,
         config=config,

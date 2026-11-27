@@ -6,6 +6,8 @@
 
 from .feature_schema import FeatureBlock, BranchResult, TimeScale
 from .feature_interfaces import BranchNotImplementedError, BranchSpec
+from .feature_profiles import B1_PROFILE, D7_PROFILE, FeatureProfile, get_profile, schema_hash
+from .feature_store import FeatureLoader, FeatureStore, ModalityFeatures, StoredFeatureRecord, validate_record
 
 __all__ = [
     "FeatureBlock",
@@ -13,4 +15,14 @@ __all__ = [
     "TimeScale",
     "BranchNotImplementedError",
     "BranchSpec",
+    "FeatureProfile",
+    "B1_PROFILE",
+    "D7_PROFILE",
+    "get_profile",
+    "schema_hash",
+    "FeatureStore",
+    "FeatureLoader",
+    "ModalityFeatures",
+    "StoredFeatureRecord",
+    "validate_record",
 ]

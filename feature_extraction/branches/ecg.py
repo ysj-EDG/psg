@@ -1,8 +1,8 @@
-"""ECG/HRV A14 候选分支。
+"""ECG/HRV 特征分支。
 
-本模块实现 ``hrv_night_candidate_a14_p1``：canonical ECG 200 Hz、
-300 秒固定窗口、连续块内 R 峰/NN 和 14 个基础 HRV 指标。它只读
-SampleContext，不修改 HDF5；H15--H20 保留在候选登记中但不计算。
+正式 ``extract()`` 实现冻结的 Stage-HRV-S2 ECG-exact 纯阶段窗口，返回
+S01/S02 两个整夜特征。文件内保留 A14 低层数学实现和显式兼容包装，供历史
+A14 回放使用；兼容层不属于正式 S2 输出。
 """
 from __future__ import annotations
 
@@ -17,6 +17,9 @@ from ..feature_schema import FeatureBlock, TimeScale
 
 BRANCH_NAME = "ecg"
 FEATURE_VERSION = "hrv_night_candidate_a14_p1"
+S2_FEATURE_VERSION = "stage_hrv_s2_v1"
+S2_FEATURE_NAMES = ("S01_N2_HF_relative", "S02_N3_HF_absolute_ms2")
+S2_FEATURE_SET_NAME = "stage_hrv_s2"
 PLANNED_TIME_SCALES = (TimeScale.WINDOW.value, TimeScale.NIGHT.value)
 ECG_FS = 200.0
 WINDOW_SECONDS = 300.0
@@ -89,7 +92,7 @@ class NNInterval:
     ordinal: int
 
 @dataclass
-class A14Computation:
+class HRVComputationResult:
     values: np.ndarray
     valid_mask: np.ndarray
     primary_reasons: np.ndarray
@@ -97,7 +100,7 @@ class A14Computation:
     diagnostics: dict[str, Any]
 
 @dataclass
-class A14WindowOutput:
+class ECGWindowHRVResult:
     values: np.ndarray
     valid_mask: np.ndarray
     primary_reasons: np.ndarray
@@ -305,10 +308,16 @@ def frequency_power_from_nn(intervals: Sequence[NNInterval], policy: Mapping[str
     lf = _integrate_band(freq, psd, *cfg["lf_hz"]); hf = _integrate_band(freq, psd, *cfg["hf_hz"])
     return lf, hf, {"continuous_support_sec": support_duration, "tachogram_span_sec": tachogram_span, "interpolation_points": int(grid.size), "interpolation_rate_hz": rate, "nperseg": nperseg, "noverlap": noverlap, "nfft": nfft, "psd_unit": "ms^2/Hz", "power_unit": "ms^2"}
 
-def _math_result(values: np.ndarray, valid: np.ndarray, reasons: list[str], failed: list[str], diagnostics: dict[str, Any]) -> A14Computation:
-    return A14Computation(np.asarray(values, dtype=np.float64), np.asarray(valid, dtype=bool), np.asarray(reasons, dtype="U64"), tuple(dict.fromkeys(failed)), diagnostics)
+def _reason_array(values: Sequence[Any]) -> np.ndarray:
+    texts = [str(value) for value in values]
+    width = max(1, max((len(value) for value in texts), default=0))
+    return np.asarray(texts, dtype=f"<U{width}")
 
-def compute_a14_from_nn(nn_values: Sequence[float], *, policy: Mapping[str, Any] | None = None, enforce_support: bool = False) -> A14Computation:
+
+def _math_result(values: np.ndarray, valid: np.ndarray, reasons: list[str], failed: list[str], diagnostics: dict[str, Any]) -> HRVComputationResult:
+    return HRVComputationResult(np.asarray(values, dtype=np.float64), np.asarray(valid, dtype=bool), _reason_array(reasons), tuple(dict.fromkeys(failed)), diagnostics)
+
+def compute_nn_hrv_metrics(nn_values: Sequence[float], *, policy: Mapping[str, Any] | None = None, enforce_support: bool = False) -> HRVComputationResult:
     cfg = _policy(policy); x = np.asarray(nn_values, dtype=np.float64).reshape(-1); values = np.full(14, np.nan, dtype=float); valid = np.zeros(14, dtype=bool); reasons = ["" for _ in range(14)]; failed: list[str] = []
     if not np.all(np.isfinite(x)):
         return _empty_computation("nonfinite_nn")
@@ -375,7 +384,7 @@ def compute_a14_from_nn(nn_values: Sequence[float], *, policy: Mapping[str, Any]
             if not valid[i] and not reasons[i]: reasons[i] = failed[0] if failed else "invalid_value"
     return _math_result(values,valid,reasons,failed,{"nn_count":int(finite.size),"adjacent_pair_count":int(pairs.size),"triple_count":len(triples),"lf_power_ms2":lf,"hf_power_ms2":hf,"psd":psd_diag})
 
-def _empty_computation(reason: str) -> A14Computation:
+def _empty_computation(reason: str) -> HRVComputationResult:
     return _math_result(np.full(14,np.nan),np.zeros(14,bool),[reason]*14,[reason],{"nn_count":0,"adjacent_pair_count":0,"triple_count":0})
 
 def _detect_block(block_signal: np.ndarray, fs: float, method: str, policy: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
@@ -406,7 +415,7 @@ def _detect_block(block_signal: np.ndarray, fs: float, method: str, policy: Mapp
     except Exception as exc:
         return np.empty(0,dtype=int), np.empty(0,dtype=int), {"status":"detection_failed","warnings":[],"error":f"{type(exc).__name__}: {exc}"}
 
-def _apply_psd_metrics(comp: A14Computation, intervals: Sequence[NNInterval], policy: Mapping[str, Any]) -> A14Computation:
+def _apply_psd_metrics(comp: HRVComputationResult, intervals: Sequence[NNInterval], policy: Mapping[str, Any]) -> HRVComputationResult:
     """用真实NN峰时间计算H06-H08，避免从NN数值伪造时间轴。"""
     values = comp.values.copy(); valid = comp.valid_mask.copy(); reasons = comp.primary_reasons.copy()
     failed = [reason for reason in comp.all_failed_conditions if reason not in {"spectral_support_insufficient", "spectral_support_requires_peak_times"}]
@@ -426,13 +435,13 @@ def _apply_psd_metrics(comp: A14Computation, intervals: Sequence[NNInterval], po
         reasons[7] = "zero_denominator" if np.isfinite(lf) and np.isfinite(hf) else str(diag.get("reason", "spectral_support_insufficient")); failed.append(reasons[7])
     support_sec = float(diag.get("continuous_support_sec", chain_support_sec(intervals))) if intervals else 0.0
     diagnostics = dict(comp.diagnostics); diagnostics.update({"continuous_support_sec": support_sec, "lf_power_ms2": lf, "hf_power_ms2": hf, "psd": diag})
-    return A14Computation(values, valid, reasons, tuple(dict.fromkeys(failed)), diagnostics)
+    return HRVComputationResult(values, valid, reasons, tuple(dict.fromkeys(failed)), diagnostics)
 
 
-def extract_window_a14(signal: np.ndarray, qc_mask: np.ndarray, *, fs: float = ECG_FS, method: str = "cleaned", policy: Mapping[str, Any] | None = None, window_start_sample: int = 0, window_start_sec: float = 0.0) -> A14WindowOutput:
-    cfg=_policy(policy); values=np.full(14,np.nan); valid=np.zeros(14,bool); reasons=np.full(14,"no_continuous_block",dtype="U64"); provenance=[]
+def compute_ecg_window_hrv(signal: np.ndarray, qc_mask: np.ndarray, *, fs: float = ECG_FS, method: str = "cleaned", policy: Mapping[str, Any] | None = None, window_start_sample: int = 0, window_start_sec: float = 0.0) -> ECGWindowHRVResult:
+    cfg=_policy(policy); values=np.full(14,np.nan); valid=np.zeros(14,bool); reasons=_reason_array(["no_continuous_block"] * 14); provenance=[]
     signal=np.asarray(signal,dtype=float).reshape(-1); qc=np.asarray(qc_mask,dtype=bool).reshape(-1)
-    if signal.size != qc.size or not np.isclose(float(fs),ECG_FS,rtol=0,atol=1e-9): return A14WindowOutput(values,valid,reasons,("schema_or_fs_error",),{"nn_count":0},provenance)
+    if signal.size != qc.size or not np.isclose(float(fs),ECG_FS,rtol=0,atol=1e-9): return ECGWindowHRVResult(values,valid,reasons,("schema_or_fs_error",),{"nn_count":0},provenance)
     allowed=np.isfinite(signal)&qc; min_samples=int(round(float(cfg["continuity"]["min_continuous_block_sec"])*fs)); blocks=_runs(allowed,min_samples); block_chains=[]
     for bid,(a,b) in enumerate(blocks):
         raw,corrected,diag=_detect_block(signal[a:b],fs,method,cfg); provenance.append({"block_id":bid,"start_sample":a+window_start_sample,"end_sample":b+window_start_sample,"status":diag.get("status"),"raw_peak_integrity":diag.get("raw_audit",{}),"corrected_peak_integrity":diag.get("corrected_audit",{}),"raw_peak_sample_indices":diag.get("raw_audit",{}).get("normalized",np.empty(0,dtype=np.int64)),"corrected_peak_sample_indices":diag.get("corrected_audit",{}).get("normalized",np.empty(0,dtype=np.int64)),"warnings":diag.get("warnings",[])})
@@ -453,7 +462,7 @@ def extract_window_a14(signal: np.ndarray, qc_mask: np.ndarray, *, fs: float = E
     candidates = [x for x in block_chains if x]
     if candidates:
         chosen = sorted(candidates, key=lambda chain: (-chain_support_sec(chain, fs), chain[0].start_peak))[0]
-        comp = _apply_psd_metrics(compute_a14_from_nn([n.value_ms for n in chosen], policy=cfg, enforce_support=True), chosen, cfg)
+        comp = _apply_psd_metrics(compute_nn_hrv_metrics([n.value_ms for n in chosen], policy=cfg, enforce_support=True), chosen, cfg)
         comp.diagnostics.update({
             "block_count": len(blocks), "chain_count": len(candidates),
             "selected_block_id": int(chosen[0].block_id), "selected_chain_index": int(candidates.index(chosen)),
@@ -464,10 +473,10 @@ def extract_window_a14(signal: np.ndarray, qc_mask: np.ndarray, *, fs: float = E
     else:
         comp = _empty_computation("no_continuous_block")
         comp.diagnostics.update({"block_count": len(blocks), "chain_count": 0, "all_chain_nn_counts": [], "all_chain_support_sec": []})
-    reasons=np.asarray(["" if x else (comp.primary_reasons[i] or "invalid_value") for i,x in enumerate(comp.valid_mask)],dtype="U64")
-    return A14WindowOutput(comp.values,comp.valid_mask,reasons,comp.all_failed_conditions,comp.diagnostics,provenance)
+    reasons=_reason_array(["" if x else (comp.primary_reasons[i] or "invalid_value") for i,x in enumerate(comp.valid_mask)])
+    return ECGWindowHRVResult(comp.values,comp.valid_mask,reasons,comp.all_failed_conditions,comp.diagnostics,provenance)
 
-def aggregate_a14_windows(values: np.ndarray, valid_mask: np.ndarray, *, min_valid_windows: int = 2) -> A14Computation:
+def aggregate_ecg_window_metrics(values: np.ndarray, valid_mask: np.ndarray, *, min_valid_windows: int = 2) -> HRVComputationResult:
     x=np.asarray(values,dtype=float); m=np.asarray(valid_mask,dtype=bool)
     if x.ndim != 2 or x.shape[1] != 14 or m.shape != x.shape: raise ValueError("A14 window arrays must be (n,14)")
     out=np.full(14,np.nan); valid=np.zeros(14,bool); reasons=["no_valid_window"]*14; counts=np.sum(m,axis=0)
@@ -477,7 +486,7 @@ def aggregate_a14_windows(values: np.ndarray, valid_mask: np.ndarray, *, min_val
     return _math_result(out,valid,reasons,[r for r in reasons if r],{"valid_window_counts":counts.astype(int).tolist(),"window_count":int(x.shape[0]),"min_valid_windows":int(min_valid_windows)})
 
 def empty_night_result(reason: str) -> BranchResult:
-    values=np.full(14,np.nan,dtype=np.float32); valid=np.zeros(14,bool); reasons=np.full(14,reason,dtype="U64")
+    values=np.full(14,np.nan,dtype=np.float32); valid=np.zeros(14,bool); reasons=_reason_array([reason] * 14)
     block=FeatureBlock(branch_name=BRANCH_NAME,feature_set_name="hrv_night_a14",time_scale=TimeScale.NIGHT,values=values,feature_names=A14_FEATURE_NAMES,valid_mask=valid,invalid_reason=reasons,config=DEFAULT_P1_POLICY,version=FEATURE_VERSION)
     return BranchResult(branch_name=BRANCH_NAME,blocks=(block,),metadata={"feature_version":FEATURE_VERSION,"scope":"full_night","error":reason})
 
@@ -485,7 +494,7 @@ def hrv_a14_model_transform(feature_name: str, value: float) -> float:
     if feature_name in {A14_FEATURE_NAMES[5],A14_FEATURE_NAMES[6]}: return float(np.log1p(value))
     return float(value)
 
-def extract(context: Any, config: Mapping[str, Any] | None = None) -> BranchResult:
+def extract_a14(context: Any, config: Mapping[str, Any] | None = None) -> BranchResult:
     cfg=_policy(config); present=np.asarray(context.channel_present("ecg"),dtype=bool).reshape(-1)
     if present.size == 0 or not bool(present[0]): return empty_night_result("channel_missing")
     try:
@@ -502,10 +511,325 @@ def extract(context: Any, config: Mapping[str, Any] | None = None) -> BranchResu
     for start in range(0,signal.size-WINDOW_SAMPLES+1,WINDOW_SAMPLES):
         out=extract_window_a14(signal[start:start+WINDOW_SAMPLES],qc[start:start+WINDOW_SAMPLES],fs=ECG_FS,method=cfg["detection"]["method"] if cfg["detection"]["method"] in {"cleaned","direct"} else "cleaned",policy=cfg,window_start_sample=start,window_start_sec=start/ECG_FS); window_values.append(out.values); window_valid.append(out.valid_mask); starts.append(start/ECG_FS)
     if not window_values: return empty_night_result("coverage_insufficient")
-    agg=aggregate_a14_windows(np.stack(window_values),np.stack(window_valid),min_valid_windows=int(cfg["night"]["min_valid_windows"]))
-    reasons=np.asarray(["" if x else agg.primary_reasons[i] for i,x in enumerate(agg.valid_mask)],dtype="U64")
+    agg=aggregate_ecg_window_metrics(np.stack(window_values),np.stack(window_valid),min_valid_windows=int(cfg["night"]["min_valid_windows"]))
+    reasons=_reason_array(["" if x else agg.primary_reasons[i] for i,x in enumerate(agg.valid_mask)])
     block=FeatureBlock(branch_name=BRANCH_NAME,feature_set_name="hrv_night_a14",time_scale=TimeScale.NIGHT,values=agg.values.astype(np.float32),feature_names=A14_FEATURE_NAMES,valid_mask=agg.valid_mask,invalid_reason=reasons,config=cfg,version=FEATURE_VERSION)
     return BranchResult(branch_name=BRANCH_NAME,blocks=(block,),metadata={"feature_version":FEATURE_VERSION,"scope":"full_night","window_starts_sec":starts,"valid_window_counts":agg.diagnostics["valid_window_counts"],"candidate_values":agg.values.tolist(),"ecg_unit_meta":unit_meta})
+
+# 旧 A14 名称仅作为历史回放兼容层；正式 S2 代码使用上面的职责命名。
+A14Computation = HRVComputationResult
+A14WindowOutput = ECGWindowHRVResult
+
+
+def compute_a14_from_nn(*args: Any, **kwargs: Any) -> HRVComputationResult:
+    return compute_nn_hrv_metrics(*args, **kwargs)
+
+
+def extract_window_a14(*args: Any, **kwargs: Any) -> ECGWindowHRVResult:
+    return compute_ecg_window_hrv(*args, **kwargs)
+
+
+def aggregate_a14_windows(*args: Any, **kwargs: Any) -> HRVComputationResult:
+    return aggregate_ecg_window_metrics(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Stage-HRV-S2 正式两维入口
+# ---------------------------------------------------------------------------
+
+S2_STAGE_NAMES = {1: "N3", 2: "N2", 3: "N1", 4: "REM"}
+S2_TARGET_CODES = frozenset(S2_STAGE_NAMES)
+S2_NREM_CODES = frozenset({1, 2, 3})
+S2_WINDOW_EPOCHS = 10
+S2_EPOCH_SECONDS = 30.0
+S2_SUBWINDOW_SECONDS = 5.0
+S2_TIME_TOLERANCE = 1e-6
+
+
+@dataclass(frozen=True)
+class ECGExactWindow:
+    key: str
+    start_pos: int
+    end_pos: int
+    stage_code: int
+    stage_name: str
+    stage_run_id: int
+    start_sec: float
+    end_sec: float
+
+
+@dataclass(frozen=True)
+class ECGExactWindowQC:
+    channel_present: bool
+    mask_available: bool
+    mask_shape_valid: bool
+    valid_5s: int
+    valid_sec: float
+    longest_valid_sec: float
+    ge120: bool
+    ge240: bool
+    all_300: bool
+
+
+def _s2_time_valid(epoch_index: np.ndarray, starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
+    n = len(epoch_index)
+    valid = np.isfinite(starts) & np.isfinite(ends) & (ends > starts)
+    valid &= np.isclose(ends - starts, S2_EPOCH_SECONDS, atol=S2_TIME_TOLERANCE, rtol=0.0)
+    if n > 1:
+        valid[1:] &= np.isclose(epoch_index[1:], epoch_index[:-1] + 1, atol=0, rtol=0)
+        valid[1:] &= np.isclose(starts[1:], ends[:-1], atol=S2_TIME_TOLERANCE, rtol=0.0)
+    return valid
+
+
+def _s2_stage_runs(stage: np.ndarray, time_valid: np.ndarray, starts: np.ndarray, ends: np.ndarray) -> list[dict[str, Any]]:
+    runs: list[dict[str, Any]] = []
+    start: int | None = None
+    code: int | None = None
+    for index in range(len(stage)):
+        current = int(stage[index])
+        accepted = bool(time_valid[index]) and current in S2_TARGET_CODES
+        continuation = accepted and start is not None and index > 0 and bool(time_valid[index - 1]) and current == code
+        if accepted and start is None:
+            start, code = index, current
+        elif accepted and not continuation:
+            if start is not None:
+                runs.append({"start": start, "end": index, "code": int(code), "duration_sec": float(ends[index - 1] - starts[start])})
+            start, code = index, current
+        elif not accepted and start is not None:
+            runs.append({"start": start, "end": index, "code": int(code), "duration_sec": float(ends[index - 1] - starts[start])})
+            start, code = None, None
+    if start is not None:
+        runs.append({"start": start, "end": len(stage), "code": int(code), "duration_sec": float(ends[-1] - starts[start])})
+    return runs
+
+
+def build_ecg_exact_windows(stage: np.ndarray, epoch_index: np.ndarray, starts: np.ndarray, ends: np.ndarray) -> tuple[list[ECGExactWindow], bool, int]:
+    time_valid = _s2_time_valid(epoch_index, starts, ends)
+    runs = _s2_stage_runs(stage, time_valid, starts, ends)
+    windows: list[ECGExactWindow] = []
+    for run_id, run in enumerate(runs):
+        code = int(run["code"])
+        start, end = int(run["start"]), int(run["end"])
+        for offset in range(0, max(0, end - start - S2_WINDOW_EPOCHS + 1), S2_WINDOW_EPOCHS):
+            a, b = start + offset, start + offset + S2_WINDOW_EPOCHS
+            windows.append(ECGExactWindow(
+                key=f"{a}:{b}:{code}", start_pos=a, end_pos=b, stage_code=code,
+                stage_name=S2_STAGE_NAMES[code], stage_run_id=run_id,
+                start_sec=float(starts[a]), end_sec=float(ends[b - 1]),
+            ))
+    valid_stage = int(np.isin(stage, list(S2_STAGE_NAMES)).sum())
+    return windows, bool(time_valid.all()), valid_stage
+
+
+def _s2_longest_true(mask: np.ndarray) -> int:
+    best = current = 0
+    for flag in np.asarray(mask, dtype=bool).reshape(-1):
+        current = current + 1 if bool(flag) else 0
+        best = max(best, current)
+    return best
+
+
+def _ecg_exact_window_qc(present: bool, invalid: np.ndarray | None, flat: np.ndarray | None, extreme: np.ndarray | None, start_pos: int, end_pos: int) -> ECGExactWindowQC:
+    if not present or invalid is None or flat is None or extreme is None:
+        return ECGExactWindowQC(present, False, False, 0, 0.0, 0.0, False, False, False)
+    arrays = [np.asarray(item) for item in (invalid, flat, extreme)]
+    shape_valid = all(item.ndim == 3 and item.shape[1] == 1 for item in arrays) and arrays[0].shape == arrays[1].shape == arrays[2].shape
+    if not shape_valid or start_pos < 0 or end_pos > arrays[0].shape[0]:
+        return ECGExactWindowQC(present, True, False, 0, 0.0, 0.0, False, False, False)
+    mask5 = ~(arrays[0][start_pos:end_pos, 0, :] | arrays[1][start_pos:end_pos, 0, :] | arrays[2][start_pos:end_pos, 0, :])
+    mask5 = mask5.reshape(-1)
+    valid_5s = int(mask5.sum())
+    longest_sec = _s2_longest_true(mask5) * S2_SUBWINDOW_SECONDS
+    return ECGExactWindowQC(True, True, True, valid_5s, valid_5s * S2_SUBWINDOW_SECONDS, longest_sec, longest_sec >= 120.0, longest_sec >= 240.0, bool(mask5.all()))
+
+
+def _ecg_exact_selection_order(windows: Sequence[ECGExactWindow]) -> list[ECGExactWindow]:
+    ordered = sorted(list(windows), key=lambda item: (item.start_sec, item.end_sec, item.key))
+    if len(ordered) <= 3:
+        return ordered
+    starts = np.asarray([float(item.start_sec) for item in ordered])
+    targets = [float(np.quantile(starts, quantile, method="linear")) for quantile in (0.25, 0.50, 0.75)]
+    result: list[ECGExactWindow] = []
+    for target in targets:
+        candidates = sorted(ordered, key=lambda item: (abs(float(item.start_sec) - target), float(item.start_sec), item.key))
+        chosen = next((item for item in candidates if item not in result), None)
+        if chosen is not None:
+            result.append(chosen)
+    remaining = sorted(ordered, key=lambda item: (min(abs(float(item.start_sec) - target) for target in targets), float(item.start_sec), item.key))
+    result.extend(item for item in remaining if item not in result)
+    return result
+
+
+def _ecg_exact_select_representative(windows: Sequence[ECGExactWindow], valid_keys: set[str], max_windows: int = 3) -> list[ECGExactWindow]:
+    return [item for item in _ecg_exact_selection_order(windows) if item.key in valid_keys][:max_windows]
+
+
+def _s2_annotation_source(context: Any) -> str:
+    path = str(getattr(getattr(context, "record", None), "caisr_edf_path", "")).lower()
+    if "algorithmic_annotations" in path or "caisr" in path:
+        return "auto"
+    if "human_annotations" in path or "expert_annotations" in path:
+        return "manual"
+    return "unavailable"
+
+
+def _s2_empty_result(reason: str, *, metadata: Mapping[str, Any] | None = None) -> BranchResult:
+    values = np.full(2, np.nan, dtype=np.float64)
+    valid = np.zeros(2, dtype=bool)
+    reasons = _reason_array([reason, reason])
+    block = FeatureBlock(
+        branch_name=BRANCH_NAME, feature_set_name=S2_FEATURE_SET_NAME, time_scale=TimeScale.NIGHT,
+        values=values, feature_names=S2_FEATURE_NAMES, valid_mask=valid, invalid_reason=reasons,
+        config=DEFAULT_P1_POLICY, version=S2_FEATURE_VERSION,
+    )
+    payload = {"feature_version": S2_FEATURE_VERSION, "feature_set_name": S2_FEATURE_SET_NAME, "scope": "full_night", "error": reason}
+    if metadata:
+        payload.update(dict(metadata))
+    return BranchResult(branch_name=BRANCH_NAME, blocks=(block,), metadata=payload)
+
+
+def _s2_reason_for_output(output: ECGWindowHRVResult, metric_index: int) -> str:
+    if bool(output.valid_mask[metric_index]) and np.isfinite(output.values[metric_index]):
+        return ""
+    reason = str(output.primary_reasons[metric_index]) if str(output.primary_reasons[metric_index]) else "invalid_value"
+    failed = [str(value) for value in output.all_failed_conditions if value]
+    return ";".join(dict.fromkeys([reason] + failed))
+
+
+def extract_stage_hrv_s2(context: Any, config: Mapping[str, Any] | None = None) -> BranchResult:
+    """从 canonical HDF5 原样执行冻结 Stage-HRV-S2 两维计算。"""
+
+    cfg = _policy(config)
+    present = np.asarray(context.channel_present("ecg"), dtype=bool).reshape(-1)
+    base_meta = {"annotation_source": _s2_annotation_source(context), "ecg_channel_present": bool(present.size and present[0])}
+    if present.size == 0 or not bool(present[0]):
+        return _s2_empty_result("channel_missing", metadata=base_meta)
+    try:
+        stored_unit = np.asarray(context.metadata("ecg", "physical_dimension")).reshape(-1)[0]
+        stage = context.read("annotations/caisr/stage").astype(np.int16, copy=False).reshape(-1)
+        timebase = context.timebase()
+        epoch_index = np.asarray(timebase["epoch_index"]).reshape(-1)
+        starts = np.asarray(timebase["epoch_start_sec"], dtype=float).reshape(-1)
+        ends = np.asarray(timebase["epoch_end_sec"], dtype=float).reshape(-1)
+        if not (len(stage) == len(epoch_index) == len(starts) == len(ends) == context.epoch_count):
+            return _s2_empty_result("ecg_exact_timebase_length_mismatch", metadata=base_meta)
+        windows, timebase_valid, valid_stage = build_ecg_exact_windows(stage, epoch_index, starts, ends)
+        invalid = np.asarray(context.quality_dataset("channel_invalid_5s", "ecg")[...], dtype=bool)
+        flat = np.asarray(context.quality_dataset("channel_flat_5s", "ecg")[...], dtype=bool)
+        extreme = np.asarray(context.quality_dataset("channel_extreme_5s", "ecg")[...], dtype=bool)
+        qcs = {window.key: _ecg_exact_window_qc(True, invalid, flat, extreme, window.start_pos, window.end_pos) for window in windows}
+        dataset = context.dataset("signals/ecg")
+        if len(dataset.shape) != 3 or tuple(dataset.shape[1:]) != (1, 6000):
+            return _s2_empty_result("processing_error", metadata=base_meta)
+    except Exception as exc:
+        return _s2_empty_result("record_processing_error", metadata={**base_meta, "error_detail": f"{type(exc).__name__}:{exc}"})
+
+    unit = bytes(stored_unit).decode("utf-8", errors="replace") if isinstance(stored_unit, (bytes, np.bytes_)) else str(stored_unit)
+    unit_signal_meta: dict[str, Any] = {}
+    by_stage = {"N2": [item for item in windows if item.stage_code == 2], "N3": [item for item in windows if item.stage_code == 1]}
+    metric_index = {"N2": 7, "N3": 6}
+    valid_keys = {"N2": set(), "N3": set()}
+    attempted_reasons = {"N2": [], "N3": []}
+    values_by_key: dict[tuple[str, str], float] = {}
+    diagnostics: list[dict[str, Any]] = []
+    for stage_name in ("N2", "N3"):
+        for window in _ecg_exact_selection_order(by_stage[stage_name]):
+            qc = qcs[window.key]
+            feature_name = "S01_N2_HF_relative" if stage_name == "N2" else "S02_N3_HF_absolute_ms2"
+            if not qc.ge120:
+                attempted_reasons[stage_name].append("qc_proxy_below_120")
+                diagnostics.append({"feature": feature_name, "window_start_sec": window.start_sec, "window_end_sec": window.end_sec, "stage_run_id": window.stage_run_id, "valid": False, "reason": "qc_proxy_below_120", "selected": False})
+                continue
+            start = int(round(window.start_sec * ECG_FS))
+            end = int(round(window.end_sec * ECG_FS))
+            raw = np.asarray(dataset[window.start_pos:window.end_pos, 0, :], dtype=float).reshape(-1)
+            signal, unit_signal_meta = normalize_ecg_input(raw, unit)
+            mask5 = ~(invalid[window.start_pos:window.end_pos, 0, :] | flat[window.start_pos:window.end_pos, 0, :] | extreme[window.start_pos:window.end_pos, 0, :])
+            qc_mask = np.repeat(mask5.reshape(-1), int(round(ECG_FS * S2_SUBWINDOW_SECONDS)))
+            if raw.size != end - start or raw.size != WINDOW_SAMPLES:
+                reason = "window_sample_count_mismatch"
+                attempted_reasons[stage_name].append(reason)
+                diagnostics.append({"feature": feature_name, "window_start_sec": window.start_sec, "window_end_sec": window.end_sec, "stage_run_id": window.stage_run_id, "valid": False, "reason": reason, "selected": False})
+                continue
+            output = compute_ecg_window_hrv(signal, qc_mask, fs=ECG_FS, method="cleaned", policy=cfg, window_start_sample=start, window_start_sec=window.start_sec)
+            index = metric_index[stage_name]
+            reason = _s2_reason_for_output(output, index)
+            valid = bool(output.valid_mask[index]) and not reason and np.isfinite(output.values[index])
+            if valid:
+                valid_keys[stage_name].add(window.key)
+                values_by_key[(stage_name, window.key)] = float(output.values[index])
+            else:
+                attempted_reasons[stage_name].extend(value for value in reason.split(";") if value)
+            diagnostics.append({
+                "feature": feature_name, "window_start_sec": window.start_sec, "window_end_sec": window.end_sec,
+                "stage_run_id": window.stage_run_id, "valid": valid, "reason": reason,
+                "value": float(output.values[index]) if np.isfinite(output.values[index]) else None,
+                "nn_count": int(output.diagnostics.get("selected_chain_nn_count", output.diagnostics.get("nn_count", 0)) or 0),
+                "selected_chain_support_sec": float(output.diagnostics.get("selected_chain_support_sec", output.diagnostics.get("continuous_support_sec", 0.0)) or 0.0),
+                "selected": False,
+            })
+            if len(valid_keys[stage_name]) >= 3:
+                break
+
+    result_values = np.full(2, np.nan, dtype=np.float64)
+    result_valid = np.zeros(2, dtype=bool)
+    result_reasons = ["", ""]
+    selected_meta: dict[str, list[dict[str, Any]]] = {"N2": [], "N3": []}
+    valid_counts: dict[str, int] = {}
+    selected_counts: dict[str, int] = {}
+    for stage_name, index in (("N2", 0), ("N3", 1)):
+        selected = _ecg_exact_select_representative(by_stage[stage_name], valid_keys[stage_name], 3)
+        selected_counts[stage_name] = len(selected)
+        valid_counts[stage_name] = len(valid_keys[stage_name])
+        selected_keys = {item.key for item in selected}
+        selected_values = [values_by_key[(stage_name, item.key)] for item in selected if (stage_name, item.key) in values_by_key]
+        for row in diagnostics:
+            if row["feature"] == S2_FEATURE_NAMES[index] and row["window_start_sec"] is not None:
+                key = next((item.key for item in by_stage[stage_name] if np.isclose(item.start_sec, row["window_start_sec"]) and np.isclose(item.end_sec, row["window_end_sec"])), None)
+                if key in selected_keys:
+                    row["selected"] = True
+        selected_meta[stage_name] = [
+            {"start_sec": item.start_sec, "end_sec": item.end_sec, "stage_run_id": item.stage_run_id, "key": item.key, "value": values_by_key.get((stage_name, item.key))}
+            for item in selected
+        ]
+        if len(selected_values) >= 2:
+            result_values[index] = float(np.median(np.asarray(selected_values, dtype=np.float64)))
+            result_valid[index] = True
+            result_reasons[index] = ""
+        elif not by_stage[stage_name]:
+            result_reasons[index] = "no_ecg_exact_stage_window"
+        else:
+            reason_values = list(dict.fromkeys(value for value in attempted_reasons[stage_name] if value))
+            reason_values.append("hrv_valid_window_count_lt2")
+            result_reasons[index] = ";".join(dict.fromkeys(reason_values))
+
+    result_status = "both_valid" if bool(result_valid.all()) else ("partial_valid" if bool(result_valid.any()) else "both_invalid")
+    metadata = {
+        "feature_version": S2_FEATURE_VERSION, "feature_set_name": S2_FEATURE_SET_NAME, "scope": "full_night",
+        **base_meta, "stage_timebase_valid": bool(timebase_valid), "valid_stage_epoch_count": int(valid_stage),
+        "ecg_exact_n2_windows": int(len(by_stage["N2"])), "ecg_exact_n3_windows": int(len(by_stage["N3"])),
+        "ecg_exact_n2_qc_ge120_windows": int(sum(qcs[item.key].ge120 for item in by_stage["N2"])),
+        "ecg_exact_n3_qc_ge120_windows": int(sum(qcs[item.key].ge120 for item in by_stage["N3"])),
+        "ecg_exact_n2_hrv_valid_windows": int(valid_counts["N2"]), "ecg_exact_n3_hrv_valid_windows": int(valid_counts["N3"]),
+        "ecg_exact_selected_n2_windows": int(selected_counts["N2"]), "ecg_exact_selected_n3_windows": int(selected_counts["N3"]),
+        "selection_n2_windows": selected_meta["N2"], "selection_n3_windows": selected_meta["N3"],
+        "s01_invalid_reason": result_reasons[0], "s02_invalid_reason": result_reasons[1],
+        "record_status": result_status, "ecg_unit_meta": unit_signal_meta,
+        "window_diagnostics": diagnostics,
+    }
+    block = FeatureBlock(
+        branch_name=BRANCH_NAME, feature_set_name=S2_FEATURE_SET_NAME, time_scale=TimeScale.NIGHT,
+        values=result_values, feature_names=S2_FEATURE_NAMES, valid_mask=result_valid,
+        invalid_reason=_reason_array(result_reasons), config=cfg, version=S2_FEATURE_VERSION,
+    )
+    return BranchResult(branch_name=BRANCH_NAME, blocks=(block,), metadata=metadata)
+
+
+def extract(context: Any, config: Mapping[str, Any] | None = None) -> BranchResult:
+    """正式 ECG 分支入口：返回 Stage-HRV-S2 的 S01/S02 两维结果。"""
+
+    return extract_stage_hrv_s2(context, config)
+
 
 def quality_gate(context: Any, config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     present=np.asarray(context.channel_present("ecg"),dtype=bool).reshape(-1)
